@@ -1,15 +1,15 @@
 // Package proxy implements meter's HTTP handlers for the Anthropic Messages
 // API.
 //
-// Week 1 scope, deliberately: every request/response body is fully buffered
-// in memory (no httputil.ReverseProxy, no streaming passthrough yet). That
-// matches the PRD's own milestone table, which puts real SSE-aware, non-
-// buffering passthrough in week 2. Buffering here is what lets this
-// handler inspect the model name, resolve a project, and read the usage
-// block back out of the response before persisting it - all things that
-// fight httputil.ReverseProxy's streaming-first design. The plan is to
-// replace this with httputil.ReverseProxy + a custom ModifyResponse once
-// streaming lands, per the PRD's Go-engineering section.
+// The forwarding mechanism is httputil.ReverseProxy with a custom
+// ModifyResponse and ErrorHandler, per the PRD's own Go-engineering section:
+// it flushes to the client after every write (FlushInterval: -1) and
+// already strips hop-by-hop headers on both legs, which is what makes real
+// token-by-token streaming possible instead of the buffer-then-forward
+// approach this package started with. What still needs custom code is
+// everything ReverseProxy doesn't know about: which project a request
+// belongs to, and what it cost - see usage_scan.go for how usage is pulled
+// out of a response without ever buffering the whole thing.
 package proxy
 
 import (
@@ -20,8 +20,8 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"regexp"
-	"strconv"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"time"
 
@@ -29,9 +29,12 @@ import (
 	"github.com/vaish725/tokenmeter/internal/store"
 )
 
-// maxRequestBodyBytes caps how much of a client request we'll buffer into
-// memory. This is a defensive boundary check (the proxy is network-facing),
-// not a business rule - 10MB comfortably covers real Messages API payloads.
+// maxRequestBodyBytes caps how much of a client REQUEST we'll buffer into
+// memory in order to inspect it (model/stream/project). This is a
+// defensive boundary check (the proxy is network-facing), not a business
+// rule - 10MB comfortably covers real Messages API payloads. Buffering the
+// request is not the thing week 2 set out to fix: prompts are small and
+// bounded, unlike a streamed response's token-by-token output.
 const maxRequestBodyBytes = 10 * 1024 * 1024
 
 // projectHeader is the explicit override in R4's attribution priority chain.
@@ -40,36 +43,53 @@ const projectHeader = "X-Meter-Project"
 // unattributedProject is what gets logged when no attribution signal exists.
 const unattributedProject = "unattributed"
 
-// hopByHopHeaders must not be copied between the inbound and outbound
-// requests/responses (RFC 7230 6.1). Building a fresh outbound request from
-// a fully-buffered body already sidesteps most of the danger here (there is
-// no real "Transfer-Encoding: chunked" to preserve), but copying these
-// verbatim can still confuse either side about connection lifecycle.
-var hopByHopHeaders = []string{
-	"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
-	"Te", "Trailers", "Transfer-Encoding", "Upgrade",
-}
-
 // AnthropicProxy holds everything the Messages API handler needs: where to
 // forward requests, how to price them, and where to log them.
 type AnthropicProxy struct {
-	upstreamURL string
-	client      *http.Client
-	store       *store.Store
-	pricing     *pricing.Table
+	store   *store.Store
+	pricing *pricing.Table
+
+	reverseProxy *httputil.ReverseProxy
 }
 
-// New builds an AnthropicProxy. No fixed request timeout is set on the HTTP
-// client - LLM calls can legitimately run for minutes, so the only thing
-// that should ever cut a request short is the client's own context
-// cancellation (see HandleMessages), not an arbitrary deadline here.
-func New(upstreamURL string, st *store.Store, pt *pricing.Table) *AnthropicProxy {
-	return &AnthropicProxy{
-		upstreamURL: strings.TrimSuffix(upstreamURL, "/"),
-		client:      &http.Client{},
-		store:       st,
-		pricing:     pt,
+// requestStateKey is the context key used to pass per-request accounting
+// state (start time, project, model, stream) from HandleMessages through to
+// ModifyResponse/ErrorHandler. A private key type avoids collisions with
+// context values set by anything else.
+type requestStateKey struct{}
+
+// requestState is everything ModifyResponse/ErrorHandler need to know about
+// a request in order to log it, gathered once up front before the request
+// is forwarded.
+type requestState struct {
+	start   time.Time
+	project string
+	model   string
+	stream  bool
+}
+
+// New builds an AnthropicProxy targeting upstreamURL. No fixed request
+// timeout is configured anywhere in this chain - LLM calls can legitimately
+// run for minutes, so the only thing that should ever cut a request short
+// is the client's own context cancellation (propagated automatically by
+// ReverseProxy via the request it forwards), not an arbitrary deadline here.
+func New(upstreamURL string, st *store.Store, pt *pricing.Table) (*AnthropicProxy, error) {
+	target, err := url.Parse(strings.TrimSuffix(upstreamURL, "/"))
+	if err != nil {
+		return nil, fmt.Errorf("proxy: parsing upstream URL %q: %w", upstreamURL, err)
 	}
+
+	p := &AnthropicProxy{store: st, pricing: pt}
+	p.reverseProxy = &httputil.ReverseProxy{
+		Director:       p.director(target),
+		ModifyResponse: p.modifyResponse,
+		ErrorHandler:   p.handleProxyError,
+		// Flush after every write instead of on a timer: the whole point of
+		// this rewrite is that a client waiting on token-by-token output
+		// sees each token as it arrives, not batched up.
+		FlushInterval: -1,
+	}
+	return p, nil
 }
 
 // requestMeta is the only part of the request body meter actually needs to
@@ -81,13 +101,14 @@ type requestMeta struct {
 	Stream bool   `json:"stream"`
 }
 
-// HandleMessages is the accounted handler for POST /v1/messages: it
-// attributes the request to a project, forwards it upstream unmodified,
-// parses token usage out of the response, prices it, and persists a record -
-// all without blocking or altering what the client actually receives.
+// HandleMessages is the accounted handler for POST /v1/messages. It buffers
+// just the request body (small and bounded - see maxRequestBodyBytes) to
+// resolve a project and read the model/stream fields, stashes that as
+// requestState on the request's context, and hands off to the shared
+// reverse proxy. ModifyResponse and ErrorHandler do the actual logging once
+// they know how the request turned out.
 func (p *AnthropicProxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	ctx := r.Context()
 	project := resolveProject(r)
 
 	body, err := readLimitedBody(w, r, maxRequestBodyBytes)
@@ -102,86 +123,82 @@ func (p *AnthropicProxy) HandleMessages(w http.ResponseWriter, r *http.Request) 
 	var meta requestMeta
 	_ = json.Unmarshal(body, &meta)
 
-	resp, err := p.forward(ctx, r, body)
-	if err != nil {
-		latency := time.Since(start)
-		p.persist(context.WithoutCancel(ctx), project, meta.Model, 0, 0, latency, 0, meta.Stream, false)
+	// Re-wrap the body we just drained so the reverse proxy can still send
+	// it upstream unmodified.
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
 
-		if ctx.Err() != nil {
-			// Client disconnected; nothing left to write a response to.
-			return
-		}
-		http.Error(w, fmt.Sprintf("upstream request failed: %v", err), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
+	state := &requestState{start: start, project: project, model: meta.Model, stream: meta.Stream}
+	r = r.WithContext(context.WithValue(r.Context(), requestStateKey{}, state))
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		latency := time.Since(start)
-		p.persist(context.WithoutCancel(ctx), project, meta.Model, 0, 0, latency, resp.StatusCode, meta.Stream, false)
-		http.Error(w, "reading upstream response failed", http.StatusBadGateway)
-		return
-	}
-
-	copyHeaders(w.Header(), resp.Header)
-	w.Header().Set("Content-Length", strconv.Itoa(len(respBody)))
-	w.WriteHeader(resp.StatusCode)
-	w.Write(respBody)
-
-	latency := time.Since(start)
-
-	inputTokens, outputTokens, usageKnown := 0, 0, false
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		inputTokens, outputTokens, usageKnown = extractUsage(resp.Header.Get("Content-Type"), respBody)
-	}
-
-	// Insert happens after the response is already flushed to the client -
-	// accounting must never add latency to the call the user is waiting on.
-	p.persist(context.WithoutCancel(ctx), project, meta.Model, inputTokens, outputTokens, latency, resp.StatusCode, meta.Stream, usageKnown)
+	p.reverseProxy.ServeHTTP(w, r)
 }
 
 // HandlePassthrough forwards any non-Messages-API path (e.g. GET /v1/models)
 // straight through with no attribution or persistence. Nothing the client
-// calls should ever be blocked just because meter doesn't account for it yet.
+// calls should ever be blocked just because meter doesn't account for it
+// yet. No requestState is stashed, so ModifyResponse knows (via a failed
+// type assertion) there's nothing to log for these.
 func (p *AnthropicProxy) HandlePassthrough(w http.ResponseWriter, r *http.Request) {
-	body, err := readLimitedBody(w, r, maxRequestBodyBytes)
-	if err != nil {
-		http.Error(w, "request body too large or unreadable", http.StatusBadRequest)
-		return
-	}
-
-	resp, err := p.forward(r.Context(), r, body)
-	if err != nil {
-		if r.Context().Err() != nil {
-			return
-		}
-		http.Error(w, fmt.Sprintf("upstream request failed: %v", err), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	copyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	p.reverseProxy.ServeHTTP(w, r)
 }
 
-// forward builds and sends the outbound request to the real provider,
-// carrying the caller's context so a client disconnect cancels the upstream
-// call rather than paying for tokens nobody will read.
-func (p *AnthropicProxy) forward(ctx context.Context, r *http.Request, body []byte) (*http.Response, error) {
-	url := p.upstreamURL + r.URL.Path
-	if r.URL.RawQuery != "" {
-		url += "?" + r.URL.RawQuery
+// director rewrites the outbound request to point at the real provider.
+// Path and query are left as ReverseProxy already cloned them from the
+// inbound request - only scheme/host need to change.
+func (p *AnthropicProxy) director(target *url.URL) func(*http.Request) {
+	return func(req *http.Request) {
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		req.Host = target.Host
+		// Meter-internal; Anthropic has no use for it and shouldn't see it.
+		req.Header.Del(projectHeader)
+	}
+}
+
+// modifyResponse installs the usage-scanning wrapper on accounted
+// responses. It runs after headers arrive from upstream but before any body
+// bytes have been copied to the client, so wrapping resp.Body here still
+// gets every byte of the body through the scanner.
+func (p *AnthropicProxy) modifyResponse(resp *http.Response) error {
+	state, ok := resp.Request.Context().Value(requestStateKey{}).(*requestState)
+	if !ok {
+		// A passthrough route - nothing to attribute or price.
+		return nil
 	}
 
-	outReq, err := http.NewRequestWithContext(ctx, r.Method, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("building upstream request: %w", err)
-	}
-	copyHeaders(outReq.Header, r.Header)
+	isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
+	scan := resp.StatusCode >= 200 && resp.StatusCode < 300
 
-	return p.client.Do(outReq)
+	resp.Body = newUsageScanningBody(resp.Body, isSSE, scan, func(inputTokens, outputTokens int, usageKnown bool) {
+		latency := time.Since(state.start)
+		// Insert happens once the body has been fully read (or the client
+		// disconnected and reading stopped early) - accounting must never
+		// add latency to the call the caller is waiting on. context.
+		// WithoutCancel: the client's own disconnect must not also cancel
+		// the DB write for the row describing that same disconnect.
+		p.persist(context.WithoutCancel(resp.Request.Context()), state.project, state.model, inputTokens, outputTokens, latency, resp.StatusCode, state.stream, usageKnown)
+	})
+	return nil
+}
+
+// handleProxyError covers failures before any response was ever received -
+// upstream connection refused, DNS failure, or the client's own context
+// canceled while still waiting on a response. (A disconnect *after*
+// headers were already relayed to the client is instead handled by
+// usageScanningBody.Close, since ReverseProxy can no longer call this once
+// a status code has been written.)
+func (p *AnthropicProxy) handleProxyError(w http.ResponseWriter, r *http.Request, err error) {
+	if state, ok := r.Context().Value(requestStateKey{}).(*requestState); ok {
+		latency := time.Since(state.start)
+		p.persist(context.WithoutCancel(r.Context()), state.project, state.model, 0, 0, latency, 0, state.stream, false)
+	}
+
+	if r.Context().Err() != nil {
+		// Client already gone; nothing left to write a response to.
+		return
+	}
+	http.Error(w, fmt.Sprintf("upstream request failed: %v", err), http.StatusBadGateway)
 }
 
 // persist writes a request record, logging (not failing the caller) if the
@@ -212,7 +229,7 @@ func (p *AnthropicProxy) persist(ctx context.Context, project, model string, inp
 // chain: an explicit header. API-key-to-project mapping and client
 // working-directory inference (the next two links) need config/infra that
 // doesn't exist yet, and cwd inference is still an open question in the PRD
-// itself (section 10) - both are deferred past week 1.
+// itself (section 10) - both remain deferred.
 func resolveProject(r *http.Request) string {
 	if p := r.Header.Get(projectHeader); p != "" {
 		return p
@@ -227,89 +244,4 @@ func readLimitedBody(w http.ResponseWriter, r *http.Request, maxBytes int64) ([]
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	defer r.Body.Close()
 	return io.ReadAll(r.Body)
-}
-
-// copyHeaders copies all headers from src to dst except hop-by-hop ones and
-// Host (Host is derived from the outbound URL, not copied).
-func copyHeaders(dst, src http.Header) {
-	for key, values := range src {
-		if strings.EqualFold(key, "Host") || isHopByHop(key) {
-			continue
-		}
-		for _, v := range values {
-			dst.Add(key, v)
-		}
-	}
-}
-
-func isHopByHop(header string) bool {
-	for _, h := range hopByHopHeaders {
-		if strings.EqualFold(header, h) {
-			return true
-		}
-	}
-	return false
-}
-
-// inputTokensPattern and outputTokensPattern back the SSE fallback path in
-// extractUsage: a real SSE parser (with a fuzz target) is a week 2
-// deliverable, so week 1 settles for scanning the fully-buffered stream body
-// for every usage number it can find.
-var (
-	inputTokensPattern  = regexp.MustCompile(`"input_tokens"\s*:\s*(\d+)`)
-	outputTokensPattern = regexp.MustCompile(`"output_tokens"\s*:\s*(\d+)`)
-)
-
-// extractUsage reads token counts out of a response body. For a plain JSON
-// response (the non-streaming case) it decodes the usage block directly.
-// For an SSE response (a client asked for stream:true; the body is still
-// fully buffered in week 1) it falls back to scanning for the last
-// occurrence of each token field, since Anthropic's stream splits input
-// tokens (message_start) and the final output token count (the last
-// message_delta) across separate events. If neither approach finds
-// anything, known is false and the caller records the row as
-// usage-unparseable rather than failing the request - matching the
-// fallback the PRD's own risk section prescribes.
-func extractUsage(contentType string, body []byte) (inputTokens, outputTokens int, known bool) {
-	if strings.Contains(contentType, "application/json") {
-		var parsed struct {
-			Usage struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
-			} `json:"usage"`
-		}
-		if err := json.Unmarshal(body, &parsed); err != nil {
-			return 0, 0, false
-		}
-		return parsed.Usage.InputTokens, parsed.Usage.OutputTokens, true
-	}
-
-	inMatches := inputTokensPattern.FindAllSubmatch(body, -1)
-	outMatches := outputTokensPattern.FindAllSubmatch(body, -1)
-	if len(inMatches) == 0 && len(outMatches) == 0 {
-		return 0, 0, false
-	}
-
-	// Output tokens accumulate across delta events, so the largest value
-	// seen is the final total. Input tokens are constant across the stream,
-	// so the largest value seen is also correct and tolerates any one
-	// malformed match.
-	return maxCapturedInt(inMatches), maxCapturedInt(outMatches), true
-}
-
-func maxCapturedInt(matches [][][]byte) int {
-	max := 0
-	for _, m := range matches {
-		if len(m) < 2 {
-			continue
-		}
-		n, err := strconv.Atoi(string(m[1]))
-		if err != nil {
-			continue
-		}
-		if n > max {
-			max = n
-		}
-	}
-	return max
 }

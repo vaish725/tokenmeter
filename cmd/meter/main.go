@@ -1,11 +1,9 @@
-// Command meter runs the local LLM spend proxy described in prd.md.
-//
-// Week 1 scope: a non-streaming, accounted pass-through for the Anthropic
-// Messages API, with every request logged to SQLite. Point
-// ANTHROPIC_BASE_URL at this process's listen address and nothing else
-// about how Claude Code / an SDK / a script calls Anthropic needs to
-// change - that "zero code changes at call sites" property is the whole
-// point of a base-URL proxy.
+// Command meter runs the local LLM spend proxy described in prd.md: a
+// streaming-safe, accounted pass-through for the Anthropic Messages API,
+// with every request logged to SQLite. Point ANTHROPIC_BASE_URL at this
+// process's listen address and nothing else about how Claude Code / an SDK
+// / a script calls Anthropic needs to change - that "zero code changes at
+// call sites" property is the whole point of a base-URL proxy.
 package main
 
 import (
@@ -42,10 +40,13 @@ func main() {
 	}
 	defer st.Close()
 
-	anthropicProxy := proxy.New(cfg.UpstreamURL, st, pricingTable)
+	anthropicProxy, err := proxy.New(cfg.UpstreamURL, st, pricingTable)
+	if err != nil {
+		log.Fatalf("meter: building proxy: %v", err)
+	}
 
 	mux := http.NewServeMux()
-	// The only path meter actually accounts for in week 1. Everything else
+	// The only path meter actually accounts for right now. Everything else
 	// (other Anthropic endpoints a client might hit) still gets proxied,
 	// just without attribution/cost tracking.
 	mux.HandleFunc("POST /v1/messages", anthropicProxy.HandleMessages)

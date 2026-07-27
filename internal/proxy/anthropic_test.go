@@ -53,8 +53,13 @@ func newTestEnv(t *testing.T, upstreamURL string) *testEnv {
 	}
 	t.Cleanup(func() { st.Close() })
 
+	p, err := New(upstreamURL, st, table)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
 	return &testEnv{
-		proxy:  New(upstreamURL, st, table),
+		proxy:  p,
 		st:     st,
 		dbPath: dbPath,
 	}
@@ -238,5 +243,185 @@ func TestHandleMessages_ClientDisconnect_CancelsUpstreamCall(t *testing.T) {
 	}
 	if row.statusCode != 0 {
 		t.Errorf("status_code = %d, want 0 (no response was ever received)", row.statusCode)
+	}
+}
+
+func TestHandleMessages_StreamingIsNotFullyBuffered(t *testing.T) {
+	const event1 = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n"
+	const event2 = "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":25}}\n\n"
+	const upstreamDelay = 150 * time.Millisecond
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		w.Write([]byte(event1))
+		flusher.Flush()
+		time.Sleep(upstreamDelay)
+		w.Write([]byte(event2))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	env := newTestEnv(t, upstream.URL)
+
+	// A real server this time, not a ResponseRecorder: proving events reach
+	// the client before the upstream is done needs a real connection and a
+	// real client reading incrementally, not just an end-state comparison.
+	meterServer := httptest.NewServer(http.HandlerFunc(env.proxy.HandleMessages))
+	defer meterServer.Close()
+
+	reqBody, _ := json.Marshal(map[string]any{"model": "test-model", "stream": true})
+
+	start := time.Now()
+	resp, err := http.Post(meterServer.URL, "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("POST to meter failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var all []byte
+	var firstByteAt time.Duration
+	buf := make([]byte, 256)
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			if len(all) == 0 {
+				firstByteAt = time.Since(start)
+			}
+			all = append(all, buf[:n]...)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("reading response body: %v", err)
+		}
+	}
+	totalAt := time.Since(start)
+
+	// The actual proof this isn't week 1's buffer-everything approach: a
+	// fully-buffered implementation would only hand back any bytes at all
+	// once the upstream had already finished, so firstByteAt would be close
+	// to totalAt instead of close to zero.
+	if firstByteAt > upstreamDelay/2 {
+		t.Errorf("first event arrived after %v, want well under the %v upstream delay before the second event - looks like the response is being buffered before forwarding", firstByteAt, upstreamDelay)
+	}
+	if totalAt < upstreamDelay {
+		t.Errorf("total response time %v was less than the upstream's own %v delay - test setup issue", totalAt, upstreamDelay)
+	}
+
+	want := event1 + event2
+	if string(all) != want {
+		t.Fatalf("body mismatch:\ngot:  %q\nwant: %q", all, want)
+	}
+
+	row := env.lastRow(t)
+	if row.inputTokens != 10 || row.outputTokens != 25 {
+		t.Errorf("tokens = %d/%d, want 10/25", row.inputTokens, row.outputTokens)
+	}
+	if row.usageKnown != 1 {
+		t.Error("usage_known = 0, want 1")
+	}
+}
+
+func TestHandleMessages_ProjectHeaderNotForwardedUpstream(t *testing.T) {
+	var headerPresent bool
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headerPresent = r.Header.Get(projectHeader) != ""
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	env := newTestEnv(t, upstream.URL)
+
+	reqBody, _ := json.Marshal(map[string]any{"model": "test-model"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set(projectHeader, "shouldnotleak")
+	w := httptest.NewRecorder()
+
+	env.proxy.HandleMessages(w, req)
+
+	if headerPresent {
+		t.Errorf("%s reached the upstream, want it stripped before forwarding (it's meter-internal)", projectHeader)
+	}
+}
+
+// setupBenchUpstream is a minimal fake Anthropic for the benchmarks below:
+// drain the request, return a small fixed JSON response immediately.
+func setupBenchUpstream() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"msg","usage":{"input_tokens":10,"output_tokens":10}}`))
+	}))
+}
+
+// BenchmarkDirectRequest is the baseline: client straight to the fake
+// upstream, no meter in between.
+func BenchmarkDirectRequest(b *testing.B) {
+	upstream := setupBenchUpstream()
+	defer upstream.Close()
+
+	reqBody, _ := json.Marshal(map[string]any{"model": "test-model"})
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resp, err := http.Post(upstream.URL, "application/json", bytes.NewReader(reqBody))
+		if err != nil {
+			b.Fatalf("request failed: %v", err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+}
+
+// BenchmarkProxyRequest is the same request through meter's accounted
+// handler. The delta between this and BenchmarkDirectRequest's ns/op is
+// the actual added overhead per request - the week 2 "latency benchmark
+// vs. direct calls" deliverable.
+func BenchmarkProxyRequest(b *testing.B) {
+	upstream := setupBenchUpstream()
+	defer upstream.Close()
+
+	dir := b.TempDir()
+	pricingPath := filepath.Join(dir, "pricing.json")
+	const pricingJSON = `{"models":{"test-model":{"input_per_mtok":3.0,"output_per_mtok":15.0}}}`
+	if err := os.WriteFile(pricingPath, []byte(pricingJSON), 0o644); err != nil {
+		b.Fatalf("writing pricing file: %v", err)
+	}
+	table, err := pricing.Load(pricingPath)
+	if err != nil {
+		b.Fatalf("pricing.Load() error = %v", err)
+	}
+	st, err := store.Open(filepath.Join(dir, "meter.db"))
+	if err != nil {
+		b.Fatalf("store.Open() error = %v", err)
+	}
+	defer st.Close()
+	p, err := New(upstream.URL, st, table)
+	if err != nil {
+		b.Fatalf("New() error = %v", err)
+	}
+
+	meterServer := httptest.NewServer(http.HandlerFunc(p.HandleMessages))
+	defer meterServer.Close()
+
+	reqBody, _ := json.Marshal(map[string]any{"model": "test-model"})
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resp, err := http.Post(meterServer.URL, "application/json", bytes.NewReader(reqBody))
+		if err != nil {
+			b.Fatalf("request failed: %v", err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
 	}
 }
