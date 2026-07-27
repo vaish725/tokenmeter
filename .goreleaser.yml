@@ -54,3 +54,4 @@ homebrew_casks:
     directory: Casks
     homepage: "https://github.com/vaish725/tokenmeter"
     description: "Local LLM spend proxy with per-project attribution and daily caps"
+    license: "MIT"
