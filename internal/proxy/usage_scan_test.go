@@ -7,6 +7,11 @@ import (
 	"testing"
 )
 
+// testAnthropicFields is the field-name spec used throughout this file;
+// TestUsageScanningBody_OpenAIFieldNames below proves the generalization
+// actually works for a different provider's field names.
+var testAnthropicFields = newUsageFields("input_tokens", "output_tokens")
+
 // fakeReadCloser lets tests wrap arbitrary bytes as an io.ReadCloser and
 // count how many times Close was actually called on the underlying body.
 type fakeReadCloser struct {
@@ -49,7 +54,7 @@ func TestUsageScanningBody_SSE_ExtractsAcrossEventsAndPassesThroughUnchanged(t *
 
 	var gotInput, gotOutput int
 	var gotKnown, doneCalled bool
-	body := newUsageScanningBody(fake, true, true, func(input, output int, known bool) {
+	body := newUsageScanningBody(fake, true, true, testAnthropicFields, func(input, output int, known bool) {
 		doneCalled = true
 		gotInput, gotOutput, gotKnown = input, output, known
 	})
@@ -85,7 +90,7 @@ func TestUsageScanningBody_JSON_ExtractsUsage(t *testing.T) {
 	fake := newFakeReadCloser([]byte(full))
 	var gotInput, gotOutput int
 	var gotKnown bool
-	body := newUsageScanningBody(fake, false, true, func(input, output int, known bool) {
+	body := newUsageScanningBody(fake, false, true, testAnthropicFields, func(input, output int, known bool) {
 		gotInput, gotOutput, gotKnown = input, output, known
 	})
 
@@ -105,7 +110,7 @@ func TestUsageScanningBody_JSON_MalformedBodyStillPassesThrough(t *testing.T) {
 
 	fake := newFakeReadCloser([]byte(full))
 	var gotKnown bool
-	body := newUsageScanningBody(fake, false, true, func(_, _ int, known bool) {
+	body := newUsageScanningBody(fake, false, true, testAnthropicFields, func(_, _ int, known bool) {
 		gotKnown = known
 	})
 
@@ -128,7 +133,7 @@ func TestUsageScanningBody_ScanDisabled_NeverExtractsEvenIfContentLooksLikeUsage
 	fake := newFakeReadCloser([]byte(full))
 	var gotKnown bool
 	var doneCalled bool
-	body := newUsageScanningBody(fake, false, false, func(_, _ int, known bool) {
+	body := newUsageScanningBody(fake, false, false, testAnthropicFields, func(_, _ int, known bool) {
 		doneCalled = true
 		gotKnown = known
 	})
@@ -156,7 +161,7 @@ func TestUsageScanningBody_JSON_OversizedBodyIsTruncatedForScanningButNotForTheC
 
 	fake := newFakeReadCloser([]byte(full))
 	var gotKnown bool
-	body := newUsageScanningBody(fake, false, true, func(_, _ int, known bool) {
+	body := newUsageScanningBody(fake, false, true, testAnthropicFields, func(_, _ int, known bool) {
 		gotKnown = known
 	})
 
@@ -177,7 +182,7 @@ func TestUsageScanningBody_JSON_OversizedBodyIsTruncatedForScanningButNotForTheC
 func TestUsageScanningBody_CloseIsIdempotent(t *testing.T) {
 	fake := newFakeReadCloser([]byte(`{"usage":{"input_tokens":1,"output_tokens":1}}`))
 	calls := 0
-	body := newUsageScanningBody(fake, false, true, func(_, _ int, _ bool) {
+	body := newUsageScanningBody(fake, false, true, testAnthropicFields, func(_, _ int, _ bool) {
 		calls++
 	})
 
@@ -188,4 +193,42 @@ func TestUsageScanningBody_CloseIsIdempotent(t *testing.T) {
 	if calls != 1 {
 		t.Errorf("onDone called %d times, want exactly 1", calls)
 	}
+}
+
+func TestUsageScanningBody_OpenAIFieldNames(t *testing.T) {
+	const full = `{"id":"chatcmpl_1","usage":{"prompt_tokens":30,"completion_tokens":12}}`
+	fields := newUsageFields("prompt_tokens", "completion_tokens")
+
+	fake := newFakeReadCloser([]byte(full))
+	var gotInput, gotOutput int
+	var gotKnown bool
+	body := newUsageScanningBody(fake, false, true, fields, func(input, output int, known bool) {
+		gotInput, gotOutput, gotKnown = input, output, known
+	})
+
+	readInChunks(t, body, 6)
+	body.Close()
+
+	if !gotKnown || gotInput != 30 || gotOutput != 12 {
+		t.Errorf("usage = %d/%d known=%v, want 30/12 known=true", gotInput, gotOutput, gotKnown)
+	}
+}
+
+// FuzzFeedSSE drives the incremental SSE scanner directly with arbitrary
+// bytes - truncated, interleaved, or outright garbage - and requires only
+// that it never panics, per the PRD's fuzz-target requirement.
+func FuzzFeedSSE(f *testing.F) {
+	f.Add([]byte(`data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}` + "\n\n"))
+	f.Add([]byte(`data: {"type":"message_delta","usage":{"output_tokens":5}}` + "\n\n"))
+	f.Add([]byte(`data: {"usage":{"prompt_tokens":3,"completion_tokens":2}}` + "\n\n"))
+	f.Add([]byte(`data: [DONE]` + "\n\n"))
+	f.Add([]byte(""))
+	f.Add([]byte("\n"))
+	f.Add([]byte(`data: {"usage":{"input_tokens":`)) // truncated mid-object
+	f.Add([]byte{0x00, 0xff, 0xfe, '\n', '"', 'i', 'n', 'p', 'u', 't', '_', 't', 'o', 'k', 'e', 'n', 's', '"'})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		body := newUsageScanningBody(newFakeReadCloser(nil), true, true, testAnthropicFields, func(int, int, bool) {})
+		body.feedSSE(data)
+	})
 }

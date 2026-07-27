@@ -33,10 +33,10 @@ func runTop(args []string) {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(w, "TIME\tPROJECT\tMODEL\tCOST\tTOKENS IN/OUT\tSTATUS\tLATENCY")
+	fmt.Fprintln(w, "TIME\tPROJECT\tPROVIDER\tMODEL\tCOST\tTOKENS IN/OUT\tSTATUS\tLATENCY")
 	for _, r := range records {
-		fmt.Fprintf(w, "%s\t%s\t%s\t$%.4f\t%d/%d\t%d\t%dms\n",
-			r.Timestamp.Local().Format("15:04:05"), r.Project, r.Model, r.CostUSD,
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t$%.4f\t%d/%d\t%d\t%dms\n",
+			r.Timestamp.Local().Format("15:04:05"), r.Project, r.Provider, r.Model, r.CostUSD,
 			r.InputTokens, r.OutputTokens, r.StatusCode, r.LatencyMS)
 	}
 	w.Flush()

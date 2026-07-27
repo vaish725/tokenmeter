@@ -21,14 +21,24 @@ const maxJSONScanBytes = 10 * 1024 * 1024
 // while scanning SSE line-by-line, in case an upstream never sends one.
 const maxPendingSSELineBytes = 64 * 1024
 
-// inputTokensPattern and outputTokensPattern find token counts in an SSE
-// line or JSON usage block. input_tokens appears once (message_start);
-// output_tokens is cumulative across message_delta events, so the max seen
-// is the final total.
-var (
-	inputTokensPattern  = regexp.MustCompile(`"input_tokens"\s*:\s*(\d+)`)
-	outputTokensPattern = regexp.MustCompile(`"output_tokens"\s*:\s*(\d+)`)
-)
+// usageFields names the JSON keys a provider's usage block uses - Anthropic
+// says input_tokens/output_tokens, OpenAI says prompt_tokens/
+// completion_tokens. Built once per provider spec, not per request.
+type usageFields struct {
+	inputPattern  *regexp.Regexp
+	outputPattern *regexp.Regexp
+	inputJSONKey  string
+	outputJSONKey string
+}
+
+func newUsageFields(inputKey, outputKey string) usageFields {
+	return usageFields{
+		inputPattern:  regexp.MustCompile(`"` + regexp.QuoteMeta(inputKey) + `"\s*:\s*(\d+)`),
+		outputPattern: regexp.MustCompile(`"` + regexp.QuoteMeta(outputKey) + `"\s*:\s*(\d+)`),
+		inputJSONKey:  inputKey,
+		outputJSONKey: outputKey,
+	}
+}
 
 // usageDoneFunc fires exactly once, on Close, with whatever usage was found
 // (usageKnown=false if none, or scanning was skipped for a non-2xx response).
@@ -41,6 +51,7 @@ type usageScanningBody struct {
 	upstream io.ReadCloser
 	scan     bool // false for non-2xx responses: nothing to bill, don't bother
 	isSSE    bool
+	fields   usageFields
 
 	pending []byte // SSE mode: bytes since the last '\n'
 	jsonBuf []byte // JSON mode: bounded accumulation of the whole body
@@ -55,11 +66,12 @@ type usageScanningBody struct {
 
 // newUsageScanningBody wraps body. isSSE picks the scanning strategy;
 // scan=false still passes bytes through but skips extraction entirely.
-func newUsageScanningBody(body io.ReadCloser, isSSE, scan bool, onDone usageDoneFunc) *usageScanningBody {
+func newUsageScanningBody(body io.ReadCloser, isSSE, scan bool, fields usageFields, onDone usageDoneFunc) *usageScanningBody {
 	return &usageScanningBody{
 		upstream: body,
 		scan:     scan,
 		isSSE:    isSSE,
+		fields:   fields,
 		onDone:   onDone,
 	}
 }
@@ -123,13 +135,13 @@ func (b *usageScanningBody) feedSSE(chunk []byte) {
 }
 
 func (b *usageScanningBody) scanLine(line []byte) {
-	if m := inputTokensPattern.FindSubmatch(line); m != nil {
+	if m := b.fields.inputPattern.FindSubmatch(line); m != nil {
 		if n, err := strconv.Atoi(string(m[1])); err == nil {
 			b.input = n
 			b.known = true
 		}
 	}
-	if m := outputTokensPattern.FindSubmatch(line); m != nil {
+	if m := b.fields.outputPattern.FindSubmatch(line); m != nil {
 		if n, err := strconv.Atoi(string(m[1])); err == nil {
 			if n > b.output {
 				b.output = n
@@ -139,19 +151,22 @@ func (b *usageScanningBody) scanLine(line []byte) {
 	}
 }
 
-// finalizeJSON decodes the bounded buffer feed() accumulated. A parse
-// failure just leaves known=false - the client already got the real bytes.
+// finalizeJSON decodes the bounded buffer feed() accumulated, looking up
+// usage by the provider's own field names. A parse failure or missing
+// field just leaves known=false - the client already got the real bytes.
 func (b *usageScanningBody) finalizeJSON() {
 	var parsed struct {
-		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-		} `json:"usage"`
+		Usage map[string]float64 `json:"usage"`
 	}
 	if err := json.Unmarshal(b.jsonBuf, &parsed); err != nil {
 		return
 	}
-	b.input = parsed.Usage.InputTokens
-	b.output = parsed.Usage.OutputTokens
+	inputVal, inputOK := parsed.Usage[b.fields.inputJSONKey]
+	outputVal, outputOK := parsed.Usage[b.fields.outputJSONKey]
+	if !inputOK && !outputOK {
+		return
+	}
+	b.input = int(inputVal)
+	b.output = int(outputVal)
 	b.known = true
 }

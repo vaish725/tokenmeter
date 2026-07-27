@@ -50,31 +50,31 @@ func runServe() {
 	}
 	defer st.Close()
 
-	anthropicProxy, err := proxy.New(cfg.UpstreamURL, st, pricingTable, ledger)
+	anthropicProxy, err := proxy.NewAnthropic(cfg.AnthropicUpstreamURL, st, pricingTable, ledger)
 	if err != nil {
-		log.Fatalf("meter: building proxy: %v", err)
+		log.Fatalf("meter: building anthropic proxy: %v", err)
+	}
+	openaiProxy, err := proxy.NewOpenAI(cfg.OpenAIUpstreamURL, st, pricingTable, ledger)
+	if err != nil {
+		log.Fatalf("meter: building openai proxy: %v", err)
 	}
 
-	mux := http.NewServeMux()
-	// The only accounted path; everything else still proxies through, just
-	// without attribution/cost tracking.
-	mux.HandleFunc("POST /v1/messages", anthropicProxy.HandleMessages)
-	mux.HandleFunc("/", anthropicProxy.HandlePassthrough)
-
-	server := &http.Server{
-		Addr:    cfg.ListenAddr,
-		Handler: mux,
-	}
+	anthropicServer := &http.Server{Addr: cfg.ListenAddr, Handler: mux(anthropicProxy)}
+	openaiServer := &http.Server{Addr: cfg.OpenAIListenAddr, Handler: mux(openaiProxy)}
 
 	// Listen for SIGINT/SIGTERM so a Ctrl-C or `systemctl stop` drains
 	// in-flight requests instead of dropping them mid-call.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	serverErr := make(chan error, 1)
+	serverErr := make(chan error, 2)
 	go func() {
-		log.Printf("meter: listening on %s, forwarding to %s", cfg.ListenAddr, cfg.UpstreamURL)
-		serverErr <- server.ListenAndServe()
+		log.Printf("meter: anthropic listening on %s, forwarding to %s", cfg.ListenAddr, cfg.AnthropicUpstreamURL)
+		serverErr <- anthropicServer.ListenAndServe()
+	}()
+	go func() {
+		log.Printf("meter: openai listening on %s, forwarding to %s", cfg.OpenAIListenAddr, cfg.OpenAIUpstreamURL)
+		serverErr <- openaiServer.ListenAndServe()
 	}()
 
 	select {
@@ -86,8 +86,21 @@ func runServe() {
 		log.Printf("meter: shutdown signal received, draining in-flight requests")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Printf("meter: graceful shutdown did not complete cleanly: %v", err)
+		if err := anthropicServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("meter: anthropic server shutdown did not complete cleanly: %v", err)
+		}
+		if err := openaiServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("meter: openai server shutdown did not complete cleanly: %v", err)
 		}
 	}
+}
+
+// mux builds a server's routes from a provider Proxy: its own accounted
+// path, plus a catch-all passthrough for everything else that provider's
+// SDK might call (e.g. GET /v1/models) without attribution/cost tracking.
+func mux(p *proxy.Proxy) *http.ServeMux {
+	m := http.NewServeMux()
+	m.HandleFunc("POST "+p.Path(), p.HandleMessages)
+	m.HandleFunc("/", p.HandlePassthrough)
+	return m
 }

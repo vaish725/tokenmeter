@@ -24,7 +24,7 @@ import (
 // so these tests exercise the same code paths meter runs in production
 // rather than mocks standing in for them.
 type testEnv struct {
-	proxy  *AnthropicProxy
+	proxy  *Proxy
 	st     *store.Store
 	dbPath string
 }
@@ -72,9 +72,9 @@ func newTestEnvWithCaps(t *testing.T, upstreamURL string, globalCapUSD, projectC
 	}
 	t.Cleanup(func() { st.Close() })
 
-	p, err := New(upstreamURL, st, table, ledger)
+	p, err := NewAnthropic(upstreamURL, st, table, ledger)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewAnthropic() error = %v", err)
 	}
 
 	return &testEnv{
@@ -88,6 +88,7 @@ func newTestEnvWithCaps(t *testing.T, upstreamURL string, globalCapUSD, projectC
 // of the store.TopRequests query path used by `meter top`.
 type requestRow struct {
 	project      string
+	provider     string
 	model        string
 	inputTokens  int
 	outputTokens int
@@ -109,9 +110,9 @@ func (e *testEnv) lastRow(t *testing.T) requestRow {
 
 	var row requestRow
 	err = db.QueryRow(`
-		SELECT project, model, input_tokens, output_tokens, cost_usd, status_code, usage_known
+		SELECT project, provider, model, input_tokens, output_tokens, cost_usd, status_code, usage_known
 		FROM requests ORDER BY id DESC LIMIT 1
-	`).Scan(&row.project, &row.model, &row.inputTokens, &row.outputTokens, &row.costUSD, &row.statusCode, &row.usageKnown)
+	`).Scan(&row.project, &row.provider, &row.model, &row.inputTokens, &row.outputTokens, &row.costUSD, &row.statusCode, &row.usageKnown)
 	if err != nil {
 		t.Fatalf("reading last row: %v", err)
 	}
@@ -147,6 +148,9 @@ func TestHandleMessages_NonStreamingHappyPath(t *testing.T) {
 	row := env.lastRow(t)
 	if row.project != "cognitiveradar" {
 		t.Errorf("project = %q, want %q", row.project, "cognitiveradar")
+	}
+	if row.provider != "anthropic" {
+		t.Errorf("provider = %q, want %q", row.provider, "anthropic")
 	}
 	if row.inputTokens != 100 || row.outputTokens != 50 {
 		t.Errorf("tokens = %d/%d, want 100/50", row.inputTokens, row.outputTokens)
@@ -499,9 +503,9 @@ func BenchmarkProxyRequest(b *testing.B) {
 		b.Fatalf("budget.New() error = %v", err)
 	}
 
-	p, err := New(upstream.URL, st, table, ledger)
+	p, err := NewAnthropic(upstream.URL, st, table, ledger)
 	if err != nil {
-		b.Fatalf("New() error = %v", err)
+		b.Fatalf("NewAnthropic() error = %v", err)
 	}
 
 	meterServer := httptest.NewServer(http.HandlerFunc(p.HandleMessages))

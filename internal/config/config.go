@@ -4,13 +4,24 @@ package config
 
 import "os"
 
-// Config holds everything the rest of the program needs to start.
+// Config holds everything the rest of the program needs to start. Two
+// listen addresses, one per provider: ANTHROPIC_BASE_URL and
+// OPENAI_BASE_URL clients could point at the same port, but both APIs
+// expose overlapping paths (e.g. /v1/models), so a single listener
+// couldn't tell an unmatched request's provider apart. Separate ports sidestep
+// the ambiguity entirely.
 type Config struct {
-	// ListenAddr is where meter's HTTP server binds, e.g. "127.0.0.1:8080".
+	// ListenAddr is where meter's Anthropic-facing server binds.
 	ListenAddr string
 
-	// UpstreamURL is the real provider base URL requests get forwarded to.
-	UpstreamURL string
+	// OpenAIListenAddr is where meter's OpenAI-facing server binds.
+	OpenAIListenAddr string
+
+	// AnthropicUpstreamURL is the real Anthropic API requests forward to.
+	AnthropicUpstreamURL string
+
+	// OpenAIUpstreamURL is the real OpenAI API requests forward to.
+	OpenAIUpstreamURL string
 
 	// DBPath is the SQLite file meter persists request metadata to.
 	DBPath string
@@ -24,31 +35,37 @@ type Config struct {
 
 // Environment variable names, kept as constants so main.go and tests agree.
 const (
-	envListenAddr  = "METER_LISTEN_ADDR"
-	envUpstreamURL = "METER_ANTHROPIC_UPSTREAM"
-	envDBPath      = "METER_DB_PATH"
-	envPricingPath = "METER_PRICING_PATH"
-	envCapsPath    = "METER_CAPS_PATH"
+	envListenAddr        = "METER_LISTEN_ADDR"
+	envOpenAIListenAddr  = "METER_OPENAI_LISTEN_ADDR"
+	envAnthropicUpstream = "METER_ANTHROPIC_UPSTREAM"
+	envOpenAIUpstream    = "METER_OPENAI_UPSTREAM"
+	envDBPath            = "METER_DB_PATH"
+	envPricingPath       = "METER_PRICING_PATH"
+	envCapsPath          = "METER_CAPS_PATH"
 )
 
 // Defaults chosen so `meter` with no environment set up at all still runs.
 const (
-	defaultListenAddr  = "127.0.0.1:8080"
-	defaultUpstreamURL = "https://api.anthropic.com"
-	defaultDBPath      = "./meter.db"
-	defaultPricingPath = "./configs/pricing.json"
-	defaultCapsPath    = "./configs/caps.json"
+	defaultListenAddr        = "127.0.0.1:8080"
+	defaultOpenAIListenAddr  = "127.0.0.1:8081"
+	defaultAnthropicUpstream = "https://api.anthropic.com"
+	defaultOpenAIUpstream    = "https://api.openai.com"
+	defaultDBPath            = "./meter.db"
+	defaultPricingPath       = "./configs/pricing.json"
+	defaultCapsPath          = "./configs/caps.json"
 )
 
 // Load reads config from the environment, defaulting anything unset. It
 // never fails - there's no required setting.
 func Load() Config {
 	return Config{
-		ListenAddr:  getEnvOrDefault(envListenAddr, defaultListenAddr),
-		UpstreamURL: getEnvOrDefault(envUpstreamURL, defaultUpstreamURL),
-		DBPath:      getEnvOrDefault(envDBPath, defaultDBPath),
-		PricingPath: getEnvOrDefault(envPricingPath, defaultPricingPath),
-		CapsPath:    getEnvOrDefault(envCapsPath, defaultCapsPath),
+		ListenAddr:           getEnvOrDefault(envListenAddr, defaultListenAddr),
+		OpenAIListenAddr:     getEnvOrDefault(envOpenAIListenAddr, defaultOpenAIListenAddr),
+		AnthropicUpstreamURL: getEnvOrDefault(envAnthropicUpstream, defaultAnthropicUpstream),
+		OpenAIUpstreamURL:    getEnvOrDefault(envOpenAIUpstream, defaultOpenAIUpstream),
+		DBPath:               getEnvOrDefault(envDBPath, defaultDBPath),
+		PricingPath:          getEnvOrDefault(envPricingPath, defaultPricingPath),
+		CapsPath:             getEnvOrDefault(envCapsPath, defaultCapsPath),
 	}
 }
 
