@@ -1,0 +1,11 @@
+{
+  "_note": "USD per 1,000,000 tokens. These are best-effort figures seeded at project bootstrap, not fetched live from Anthropic. Verify against Anthropic's current pricing page before trusting cost numbers for real budgeting decisions, and update this file (not the code) whenever prices change - that separation is the whole point of keeping pricing out of Go source.",
+  "models": {
+    "claude-opus-5": { "input_per_mtok": 15.0, "output_per_mtok": 75.0 },
+    "claude-sonnet-5": { "input_per_mtok": 3.0, "output_per_mtok": 15.0 },
+    "claude-haiku-4-5-20251001": { "input_per_mtok": 1.0, "output_per_mtok": 5.0 },
+    "claude-3-5-sonnet-20241022": { "input_per_mtok": 3.0, "output_per_mtok": 15.0 },
+    "claude-3-5-haiku-20241022": { "input_per_mtok": 0.8, "output_per_mtok": 4.0 },
+    "claude-3-opus-20240229": { "input_per_mtok": 15.0, "output_per_mtok": 75.0 }
+  }
+}

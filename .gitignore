@@ -1,0 +1,9 @@
+# Runtime SQLite database and its WAL/journal siblings - local state, not source.
+/meter.db
+/meter.db-*
+
+# Local build output, if anyone runs `go build -o bin/...`.
+/bin/
+
+# Never pushed to the GitHub remote - kept local-only by explicit instruction.
+/prd.md
