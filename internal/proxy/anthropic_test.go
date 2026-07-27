@@ -441,6 +441,69 @@ func TestHandleMessages_SuccessReconcilesIntoLedger(t *testing.T) {
 	}
 }
 
+// TestHandleMessages_UnpricedModelStillGetsCapped guards against a real bug:
+// pricing.Table.Cost returned 0 for any model missing from pricing.json,
+// which meant it reserved nothing and could never be capped - a brand new
+// model release or a typo in a model name silently bypassed the daily cap
+// entirely. A configured default_price fallback closes that gap.
+func TestHandleMessages_UnpricedModelStillGetsCapped(t *testing.T) {
+	var upstreamHit bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	dir := t.TempDir()
+
+	pricingPath := filepath.Join(dir, "pricing.json")
+	// No model-specific rates at all - only the fallback. If Cost() ever
+	// regresses to returning 0 for an unlisted model, this test catches it.
+	const pricingJSON = `{"models": {}, "default_price": {"input_per_mtok": 1000000, "output_per_mtok": 1000000}}`
+	if err := os.WriteFile(pricingPath, []byte(pricingJSON), 0o644); err != nil {
+		t.Fatalf("writing pricing file: %v", err)
+	}
+	table, err := pricing.Load(pricingPath)
+	if err != nil {
+		t.Fatalf("pricing.Load() error = %v", err)
+	}
+
+	capsPath := filepath.Join(dir, "caps.json")
+	const capsJSON = `{"global_daily_cap_usd": 1000, "default_project_cap_usd": 0.01, "project_caps_usd": {}}`
+	if err := os.WriteFile(capsPath, []byte(capsJSON), 0o644); err != nil {
+		t.Fatalf("writing caps file: %v", err)
+	}
+	ledger, err := budget.New(capsPath)
+	if err != nil {
+		t.Fatalf("budget.New() error = %v", err)
+	}
+
+	st, err := store.Open(filepath.Join(dir, "meter_test.db"))
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	p, err := NewAnthropic(upstream.URL, st, table, ledger, nil)
+	if err != nil {
+		t.Fatalf("NewAnthropic() error = %v", err)
+	}
+
+	reqBody, _ := json.Marshal(map[string]any{"model": "some-brand-new-model", "max_tokens": 10})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set(projectHeader, "unpriced-test")
+	w := httptest.NewRecorder()
+
+	p.HandleMessages(w, req)
+
+	if upstreamHit {
+		t.Fatal("upstream was hit for an unpriced model against a tiny cap - it should have been rejected like any other over-cap request")
+	}
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 - an unpriced model must still be capped via the fallback price, not treated as free", w.Code)
+	}
+}
+
 // setupBenchUpstream is a minimal fake Anthropic for the benchmarks below:
 // drain the request, return a small fixed JSON response immediately.
 func setupBenchUpstream() *httptest.Server {

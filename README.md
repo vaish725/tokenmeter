@@ -99,7 +99,11 @@ curl $ANTHROPIC_BASE_URL/v1/messages \
 All three files are plain JSON, live in `configs/`, and can be edited
 without a rebuild:
 
-- `pricing.json` - USD per million tokens, per model. Reconciliation
+- `pricing.json` - USD per million tokens, per model, plus an optional
+  `default_price` fallback used for any model not explicitly listed. That
+  fallback matters: without it, a model missing from this file costs $0 and
+  never counts against your cap - a new model release or a typo in a model
+  name would otherwise bypass the daily limit entirely. Reconciliation
   against real `usage` bounds the error even if a price goes stale.
 - `caps.json` - a global daily cap and a default per-project cap, with
   optional per-project overrides. Resets at local midnight.

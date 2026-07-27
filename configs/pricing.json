@@ -1,5 +1,5 @@
 {
-  "_note": "USD per 1,000,000 tokens. Best-effort figures, not fetched live from either provider. Verify against Anthropic's and OpenAI's current pricing pages before trusting cost numbers for real budgeting decisions, and update this file (not the code) whenever prices change - that separation is the whole point of keeping pricing out of Go source.",
+  "_note": "USD per 1,000,000 tokens. Best-effort figures, not fetched live from either provider. Verify against Anthropic's and OpenAI's current pricing pages before trusting cost numbers for real budgeting decisions, and update this file (not the code) whenever prices change - that separation is the whole point of keeping pricing out of Go source. default_price applies to any model not listed above, so a new model release or a model-name typo still counts against your daily cap instead of silently costing $0 and bypassing it - set conservatively high (currently Opus/o1-tier rates) on purpose.",
   "models": {
     "claude-opus-5": { "input_per_mtok": 15.0, "output_per_mtok": 75.0 },
     "claude-sonnet-5": { "input_per_mtok": 3.0, "output_per_mtok": 15.0 },
@@ -14,5 +14,6 @@
     "o1": { "input_per_mtok": 15.0, "output_per_mtok": 60.0 },
     "o3-mini": { "input_per_mtok": 1.1, "output_per_mtok": 4.4 },
     "o4-mini": { "input_per_mtok": 1.1, "output_per_mtok": 4.4 }
-  }
+  },
+  "default_price": { "input_per_mtok": 15.0, "output_per_mtok": 75.0 }
 }

@@ -78,3 +78,40 @@ func TestCost(t *testing.T) {
 		})
 	}
 }
+
+// TestCost_UnknownModelFallsBackToDefaultPrice guards against the real bug
+// this closed: an unpriced model computing to a $0 cost, which meant it
+// reserved nothing and could never be capped - a new model release or a
+// typo in a model name silently bypassed the daily cap entirely.
+func TestCost_UnknownModelFallsBackToDefaultPrice(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pricing.json")
+	const contents = `{
+		"models": {
+			"test-model": {"input_per_mtok": 3.0, "output_per_mtok": 15.0}
+		},
+		"default_price": {"input_per_mtok": 15.0, "output_per_mtok": 75.0}
+	}`
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("writing test pricing file: %v", err)
+	}
+	table, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	cost, known := table.Cost("some-brand-new-model", 1_000_000, 1_000_000)
+	if !known {
+		t.Fatal("known = false, want true - a configured default_price must always produce a usable cost")
+	}
+	const want = 90.0 // 1*15.0 (input) + 1*75.0 (output)
+	if cost != want {
+		t.Errorf("cost = %v, want %v (the fallback rate, not 0)", cost, want)
+	}
+
+	// An exact match must still win over the fallback.
+	exactCost, _ := table.Cost("test-model", 1_000_000, 1_000_000)
+	if exactCost != 18.0 {
+		t.Errorf("cost for a listed model = %v, want 18.0 (its own rate, not the fallback)", exactCost)
+	}
+}
