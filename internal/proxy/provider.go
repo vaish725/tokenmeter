@@ -254,6 +254,15 @@ func (p *Proxy) director(target *url.URL) func(*http.Request) {
 		req.Host = target.Host
 		// Meter-internal; the provider has no use for it and shouldn't see it.
 		req.Header.Del(projectHeader)
+		// A client's own Accept-Encoding (nearly universal in real HTTP
+		// clients) makes Go's Transport skip its usual transparent gzip
+		// decompression, so the response would arrive still gzip-encoded -
+		// readable fine by the client's own HTTP library, but unreadable
+		// as JSON/SSE text by usage_scan.go, silently zeroing out cost
+		// tracking. Forcing identity here means the provider never
+		// compresses in the first place; an uncompressed response is
+		// something every HTTP client handles regardless of what it asked for.
+		req.Header.Set("Accept-Encoding", "identity")
 	}
 }
 

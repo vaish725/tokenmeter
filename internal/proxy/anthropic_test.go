@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -360,6 +362,61 @@ func TestHandleMessages_ProjectHeaderNotForwardedUpstream(t *testing.T) {
 
 	if headerPresent {
 		t.Errorf("%s reached the upstream, want it stripped before forwarding (it's meter-internal)", projectHeader)
+	}
+}
+
+// TestHandleMessages_UpstreamNeverAsksForCompression guards against a real
+// bug found during dogfooding: relaying the client's own Accept-Encoding
+// header made Go's Transport skip its usual transparent gzip decompression,
+// so a real provider's compressed response arrived unreadable as JSON to
+// the usage scanner - readable fine by the client's own HTTP library, but
+// silently zeroing out cost tracking (status 200, cost $0, usage_known=0).
+// This fake upstream behaves like a real compression-aware server: it
+// actually gzips the response if asked to, so the test only passes if
+// meter no longer asks for it.
+func TestHandleMessages_UpstreamNeverAsksForCompression(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		const body = `{"usage":{"input_tokens":10,"output_tokens":5}}`
+		w.Header().Set("Content-Type", "application/json")
+
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.WriteHeader(http.StatusOK)
+			gz := gzip.NewWriter(w)
+			gz.Write([]byte(body))
+			gz.Close()
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(body))
+	}))
+	defer upstream.Close()
+
+	env := newTestEnv(t, upstream.URL)
+
+	reqBody, _ := json.Marshal(map[string]any{"model": "test-model"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(reqBody))
+	// Simulate a real client that advertises compression support, like
+	// virtually every production HTTP client does by default.
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	w := httptest.NewRecorder()
+
+	env.proxy.HandleMessages(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if w.Header().Get("Content-Encoding") == "gzip" {
+		t.Fatal("client received a gzip-encoded response - the upstream compressed it, meaning Accept-Encoding was not overridden")
+	}
+
+	row := env.lastRow(t)
+	if row.usageKnown != 1 {
+		t.Error("usage_known = 0, want 1 - the response must have arrived compressed and unreadable to the usage scanner")
+	}
+	if row.inputTokens != 10 || row.outputTokens != 5 {
+		t.Errorf("tokens = %d/%d, want 10/5", row.inputTokens, row.outputTokens)
 	}
 }
 
