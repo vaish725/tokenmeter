@@ -1,37 +1,47 @@
-// Command meter runs the local LLM spend proxy described in prd.md: a
-// streaming-safe, accounted pass-through for the Anthropic Messages API,
-// with every request logged to SQLite. Point ANTHROPIC_BASE_URL at this
-// process's listen address and nothing else about how Claude Code / an SDK
-// / a script calls Anthropic needs to change - that "zero code changes at
-// call sites" property is the whole point of a base-URL proxy.
+// Command meter runs the local LLM spend proxy described in prd.md. Point
+// ANTHROPIC_BASE_URL at this process's listen address - nothing else about
+// how a client calls Anthropic needs to change.
 package main
 
 import (
 	"context"
 	"log"
 	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/vaish725/tokenmeter/internal/budget"
 	"github.com/vaish725/tokenmeter/internal/config"
 	"github.com/vaish725/tokenmeter/internal/pricing"
 	"github.com/vaish725/tokenmeter/internal/proxy"
 	"github.com/vaish725/tokenmeter/internal/store"
 )
 
-// shutdownTimeout bounds how long meter waits for in-flight requests to
-// finish on SIGTERM/SIGINT before forcing a close. Long enough to let a
-// real LLM call complete, short enough that a stuck connection doesn't hang
-// a shutdown forever.
+// shutdownTimeout bounds how long meter drains in-flight requests on
+// SIGTERM/SIGINT before forcing a close.
 const shutdownTimeout = 30 * time.Second
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "top" {
+		runTop(os.Args[2:])
+		return
+	}
+	runServe()
+}
+
+func runServe() {
 	cfg := config.Load()
 
 	pricingTable, err := pricing.Load(cfg.PricingPath)
 	if err != nil {
 		log.Fatalf("meter: loading pricing table: %v", err)
+	}
+
+	ledger, err := budget.New(cfg.CapsPath)
+	if err != nil {
+		log.Fatalf("meter: loading budget caps: %v", err)
 	}
 
 	st, err := store.Open(cfg.DBPath)
@@ -40,15 +50,14 @@ func main() {
 	}
 	defer st.Close()
 
-	anthropicProxy, err := proxy.New(cfg.UpstreamURL, st, pricingTable)
+	anthropicProxy, err := proxy.New(cfg.UpstreamURL, st, pricingTable, ledger)
 	if err != nil {
 		log.Fatalf("meter: building proxy: %v", err)
 	}
 
 	mux := http.NewServeMux()
-	// The only path meter actually accounts for right now. Everything else
-	// (other Anthropic endpoints a client might hit) still gets proxied,
-	// just without attribution/cost tracking.
+	// The only accounted path; everything else still proxies through, just
+	// without attribution/cost tracking.
 	mux.HandleFunc("POST /v1/messages", anthropicProxy.HandleMessages)
 	mux.HandleFunc("/", anthropicProxy.HandlePassthrough)
 

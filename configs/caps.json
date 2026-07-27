@@ -1,0 +1,6 @@
+{
+  "_note": "USD per local day, resets at midnight. Edit anytime - no rebuild needed.",
+  "global_daily_cap_usd": 5.0,
+  "default_project_cap_usd": 2.0,
+  "project_caps_usd": {}
+}

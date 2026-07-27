@@ -1,14 +1,6 @@
-// The SSE-aware response body wrapper: this is the piece the PRD calls out
-// as the interesting constraint of the whole project - it has to forward
-// every byte to the client the instant it arrives (no full-body buffering,
-// or the client's token-by-token stream turns into one big pause-then-dump)
-// while still surfacing the usage numbers that only become fully known once
-// the tail of the response has gone by.
-//
-// The trick is that Read() never delays the caller: it passes through
-// exactly the bytes the upstream just produced, and only *afterward*, on
-// those same already-in-hand bytes, does any scanning. Nothing here holds a
-// byte back waiting to decide what to do with it.
+// The SSE-aware response body wrapper: forwards every byte to the client
+// immediately (no full-body buffering) while still surfacing usage numbers
+// that only become known once the tail of the response has gone by.
 package proxy
 
 import (
@@ -20,41 +12,31 @@ import (
 	"sync"
 )
 
-// maxJSONScanBytes bounds how much of a non-streaming JSON response body
-// gets accumulated for usage parsing. Real Messages API JSON responses are
-// small and arrive as a single chunk regardless - this cap is a defensive
-// boundary against something unexpectedly huge claiming to be JSON, not a
-// real limit on the response the client receives (the client still gets
-// every byte; this only bounds what we keep a second copy of for scanning).
+// maxJSONScanBytes bounds the second copy kept for usage parsing on a
+// non-streaming response - a defensive cap, not a limit on what the client
+// receives (real JSON responses are small anyway).
 const maxJSONScanBytes = 10 * 1024 * 1024
 
 // maxPendingSSELineBytes bounds the "bytes since the last newline" buffer
-// used while scanning an SSE stream line-by-line. An upstream that never
-// sends '\n' would otherwise grow this forever; past the cap we simply give
-// up on usage extraction for this response (the client's own copy of the
-// bytes is completely unaffected).
+// while scanning SSE line-by-line, in case an upstream never sends one.
 const maxPendingSSELineBytes = 64 * 1024
 
-// inputTokensPattern and outputTokensPattern find token counts inside a
-// single SSE line or a JSON usage block. Anthropic's stream splits these
-// across events: input_tokens appears once, in message_start; output_tokens
-// appears repeatedly (cumulatively) across message_delta events, so the
-// largest value seen is the final total.
+// inputTokensPattern and outputTokensPattern find token counts in an SSE
+// line or JSON usage block. input_tokens appears once (message_start);
+// output_tokens is cumulative across message_delta events, so the max seen
+// is the final total.
 var (
 	inputTokensPattern  = regexp.MustCompile(`"input_tokens"\s*:\s*(\d+)`)
 	outputTokensPattern = regexp.MustCompile(`"output_tokens"\s*:\s*(\d+)`)
 )
 
-// usageDoneFunc is called exactly once, when the wrapped body is closed,
-// with whatever usage information was found (or usageKnown=false if none
-// was, or scanning was skipped entirely for a non-2xx response).
+// usageDoneFunc fires exactly once, on Close, with whatever usage was found
+// (usageKnown=false if none, or scanning was skipped for a non-2xx response).
 type usageDoneFunc func(inputTokens, outputTokens int, usageKnown bool)
 
-// usageScanningBody wraps a response body so that reading it is a pure
-// passthrough to the caller, while a side channel accumulates just enough
-// state to answer "how many tokens did this cost" once the body is fully
-// read (or the client disconnects and reading stops early - either way,
-// Close() still fires and whatever was seen so far gets logged).
+// usageScanningBody wraps a response body: Read is a pure passthrough,
+// while a side channel accumulates enough state to answer "what did this
+// cost" once Close fires - even if the client disconnected early.
 type usageScanningBody struct {
 	upstream io.ReadCloser
 	scan     bool // false for non-2xx responses: nothing to bill, don't bother
@@ -71,9 +53,8 @@ type usageScanningBody struct {
 	onDone usageDoneFunc
 }
 
-// newUsageScanningBody wraps body. isSSE selects which of the two scanning
-// strategies applies; scan=false skips scanning entirely (still passes
-// bytes through) for responses where there's nothing meaningful to extract.
+// newUsageScanningBody wraps body. isSSE picks the scanning strategy;
+// scan=false still passes bytes through but skips extraction entirely.
 func newUsageScanningBody(body io.ReadCloser, isSSE, scan bool, onDone usageDoneFunc) *usageScanningBody {
 	return &usageScanningBody{
 		upstream: body,
@@ -83,10 +64,8 @@ func newUsageScanningBody(body io.ReadCloser, isSSE, scan bool, onDone usageDone
 	}
 }
 
-// Read is a pure passthrough: whatever bytes the upstream produced go
-// straight into the caller's buffer, immediately. Scanning happens as a
-// side effect on the same bytes, after they're already on their way to the
-// client - it can never add latency to delivery.
+// Read passes upstream bytes straight into the caller's buffer; scanning
+// happens as a side effect afterward, so it never adds delivery latency.
 func (b *usageScanningBody) Read(p []byte) (int, error) {
 	n, err := b.upstream.Read(p)
 	if n > 0 && b.scan {
@@ -95,11 +74,8 @@ func (b *usageScanningBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// Close closes the real body and, exactly once, reports whatever usage was
-// found. sync.Once guards against double-reporting if something ever calls
-// Close more than once (httputil.ReverseProxy only calls it once itself,
-// but a wrong double cost/count would be a real correctness bug, so this
-// costs nothing to guarantee).
+// Close closes the real body and, exactly once (sync.Once guards against a
+// double-call double-counting cost), reports whatever usage was found.
 func (b *usageScanningBody) Close() error {
 	err := b.upstream.Close()
 	b.once.Do(func() {
@@ -126,9 +102,8 @@ func (b *usageScanningBody) feed(chunk []byte) {
 	b.jsonBuf = append(b.jsonBuf, chunk...)
 }
 
-// feedSSE splits the accumulated bytes into complete lines and scans each
-// one as it completes, keeping only the still-incomplete tail around for
-// next time - the bounded-memory alternative to buffering the whole stream.
+// feedSSE scans each complete line as it forms, keeping only the
+// incomplete tail for next time - bounded memory instead of buffering it all.
 func (b *usageScanningBody) feedSSE(chunk []byte) {
 	b.pending = append(b.pending, chunk...)
 	for {
@@ -164,12 +139,8 @@ func (b *usageScanningBody) scanLine(line []byte) {
 	}
 }
 
-// finalizeJSON runs once, on Close, for non-streaming responses: decode the
-// bounded buffer accumulated by feed() and pull the usage block out of it.
-// A parse failure (truncated capture, or a response that wasn't really
-// JSON despite its Content-Type) leaves known=false rather than panicking
-// or failing the request - the bytes already reached the client untouched
-// regardless of whether this succeeds.
+// finalizeJSON decodes the bounded buffer feed() accumulated. A parse
+// failure just leaves known=false - the client already got the real bytes.
 func (b *usageScanningBody) finalizeJSON() {
 	var parsed struct {
 		Usage struct {

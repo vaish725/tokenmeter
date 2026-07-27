@@ -21,11 +21,9 @@ func newFakeReadCloser(data []byte) *fakeReadCloser {
 func (f *fakeReadCloser) Read(p []byte) (int, error) { return f.r.Read(p) }
 func (f *fakeReadCloser) Close() error               { f.closeCount++; return nil }
 
-// readInChunks reads r using a deliberately small, odd-sized buffer so that
-// lines and JSON tokens get split across arbitrary byte boundaries - the
-// exact scenario the incremental scanner has to handle correctly, unlike
-// io.ReadAll which would likely hand back the whole small test input in one
-// call and never exercise the split-line logic at all.
+// readInChunks reads with a small, odd-sized buffer so lines and JSON
+// tokens split across arbitrary byte boundaries, exercising the scanner
+// the way io.ReadAll (one big read) wouldn't.
 func readInChunks(t *testing.T, r io.Reader, chunkSize int) []byte {
 	t.Helper()
 	var out []byte
@@ -56,8 +54,6 @@ func TestUsageScanningBody_SSE_ExtractsAcrossEventsAndPassesThroughUnchanged(t *
 		gotInput, gotOutput, gotKnown = input, output, known
 	})
 
-	// An awkward, small chunk size forces lines (and the JSON inside them)
-	// to split across arbitrary Read() boundaries.
 	got := readInChunks(t, body, 7)
 	if string(got) != full {
 		t.Fatalf("passthrough bytes altered: got %q, want %q", got, full)
@@ -152,11 +148,9 @@ func TestUsageScanningBody_ScanDisabled_NeverExtractsEvenIfContentLooksLikeUsage
 }
 
 func TestUsageScanningBody_JSON_OversizedBodyIsTruncatedForScanningButNotForTheClient(t *testing.T) {
-	// A JSON body past maxJSONScanBytes must still reach the client in
-	// full - only the *scanning* copy is capped. Truncating a JSON string
-	// literal mid-way makes the captured copy invalid JSON, which is the
-	// observable proof the cap actually applied (known should end up
-	// false), while the client-facing bytes must be completely unaffected.
+	// A body past maxJSONScanBytes must still reach the client in full;
+	// only the scanning copy is capped, truncating the JSON mid-string and
+	// making known=false the observable proof the cap applied.
 	padding := strings.Repeat("x", maxJSONScanBytes+1024)
 	full := `{"usage":{"input_tokens":1,"output_tokens":2},"padding":"` + padding + `"}`
 

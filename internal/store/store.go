@@ -1,14 +1,6 @@
-// Package store persists per-request spend metadata to a local SQLite file.
-//
-// The driver is modernc.org/sqlite, a pure-Go implementation with no cgo
-// dependency. That choice is deliberate and made this early on purpose: the
-// PRD's packaging goal (weeks 5-6) is a single static binary built with
-// CGO_ENABLED=0, and a cgo-based driver (e.g. mattn/go-sqlite3) would have
-// to be ripped out later to get there. Paying that cost now is free; paying
-// it after the schema and queries exist would not be.
-//
-// Only metadata is stored here, never prompt bodies - that mirrors the PRD's
-// non-goal of storing prompt bodies by default.
+// Package store persists per-request spend metadata (never prompt bodies)
+// to a local SQLite file, via modernc.org/sqlite - pure Go, no cgo, so the
+// eventual static binary needs no rework later.
 package store
 
 import (
@@ -20,11 +12,9 @@ import (
 	_ "modernc.org/sqlite" // registers the "sqlite" database/sql driver
 )
 
-// Record is one logged proxy request, matching every field the PRD's R6
-// requires: timestamp, project, model, input/output tokens, cost, latency,
-// status, and stream-vs-not. UsageKnown distinguishes "zero tokens" (a real,
-// known-zero cost) from "we could not parse usage from this response" -
-// collapsing those two would quietly corrupt spend totals.
+// Record is one logged proxy request. UsageKnown distinguishes a real
+// known-zero cost from "usage couldn't be parsed" - conflating the two
+// would quietly corrupt spend totals.
 type Record struct {
 	Timestamp    time.Time
 	Project      string
@@ -43,10 +33,8 @@ type Store struct {
 	db *sql.DB
 }
 
-// schema creates the requests table if it doesn't already exist. Using
-// "IF NOT EXISTS" here rather than a migration framework is intentional:
-// week 1 has exactly one schema version, and a migration tool is complexity
-// with no payoff until the schema actually needs to change.
+// schema creates the requests table if needed - no migration framework
+// yet, since there's only one schema version so far.
 const schema = `
 CREATE TABLE IF NOT EXISTS requests (
 	id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,9 +59,8 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("store: opening %s: %w", path, err)
 	}
 
-	// SQLite only allows one writer at a time; a single connection avoids
-	// "database is locked" errors from the driver trying to parallelize
-	// writes across a pool it can't actually serialize itself.
+	// SQLite allows one writer at a time; one connection avoids "database
+	// is locked" errors from a pool trying to parallelize writes.
 	db.SetMaxOpenConns(1)
 
 	if _, err := db.Exec(schema); err != nil {
@@ -113,6 +100,40 @@ func (s *Store) Insert(ctx context.Context, r Record) error {
 		return fmt.Errorf("store: inserting request record: %w", err)
 	}
 	return nil
+}
+
+// TopRequests returns the costliest requests since since, for `meter top`.
+func (s *Store) TopRequests(ctx context.Context, since time.Time, limit int) ([]Record, error) {
+	const q = `
+	SELECT timestamp, project, model, input_tokens, output_tokens, cost_usd, latency_ms, status_code, stream, usage_known
+	FROM requests WHERE timestamp >= ? ORDER BY cost_usd DESC LIMIT ?
+	`
+	rows, err := s.db.QueryContext(ctx, q, since.UTC().Format(time.RFC3339), limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: querying top requests: %w", err)
+	}
+	defer rows.Close()
+
+	var records []Record
+	for rows.Next() {
+		var r Record
+		var ts string
+		var stream, usageKnown int
+		if err := rows.Scan(&ts, &r.Project, &r.Model, &r.InputTokens, &r.OutputTokens, &r.CostUSD, &r.LatencyMS, &r.StatusCode, &stream, &usageKnown); err != nil {
+			return nil, fmt.Errorf("store: scanning top request row: %w", err)
+		}
+		r.Timestamp, err = time.Parse(time.RFC3339, ts)
+		if err != nil {
+			return nil, fmt.Errorf("store: parsing timestamp %q: %w", ts, err)
+		}
+		r.Stream = stream != 0
+		r.UsageKnown = usageKnown != 0
+		records = append(records, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterating top requests: %w", err)
+	}
+	return records, nil
 }
 
 func boolToInt(b bool) int {

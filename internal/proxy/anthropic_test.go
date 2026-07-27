@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vaish725/tokenmeter/internal/budget"
 	"github.com/vaish725/tokenmeter/internal/pricing"
 	"github.com/vaish725/tokenmeter/internal/store"
 )
@@ -27,7 +29,14 @@ type testEnv struct {
 	dbPath string
 }
 
+// newTestEnv wires an env with generous caps, so existing tests aren't
+// affected by budget rejection; newTestEnvWithCaps is for cap-specific tests.
 func newTestEnv(t *testing.T, upstreamURL string) *testEnv {
+	t.Helper()
+	return newTestEnvWithCaps(t, upstreamURL, 1000, 1000)
+}
+
+func newTestEnvWithCaps(t *testing.T, upstreamURL string, globalCapUSD, projectCapUSD float64) *testEnv {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -46,6 +55,16 @@ func newTestEnv(t *testing.T, upstreamURL string) *testEnv {
 		t.Fatalf("pricing.Load() error = %v", err)
 	}
 
+	capsPath := filepath.Join(dir, "caps.json")
+	capsJSON := fmt.Sprintf(`{"global_daily_cap_usd": %f, "default_project_cap_usd": %f, "project_caps_usd": {}}`, globalCapUSD, projectCapUSD)
+	if err := os.WriteFile(capsPath, []byte(capsJSON), 0o644); err != nil {
+		t.Fatalf("writing test caps file: %v", err)
+	}
+	ledger, err := budget.New(capsPath)
+	if err != nil {
+		t.Fatalf("budget.New() error = %v", err)
+	}
+
 	dbPath := filepath.Join(dir, "meter_test.db")
 	st, err := store.Open(dbPath)
 	if err != nil {
@@ -53,7 +72,7 @@ func newTestEnv(t *testing.T, upstreamURL string) *testEnv {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	p, err := New(upstreamURL, st, table)
+	p, err := New(upstreamURL, st, table, ledger)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -65,9 +84,8 @@ func newTestEnv(t *testing.T, upstreamURL string) *testEnv {
 	}
 }
 
-// requestRow is what the tests read back to assert a persisted record - a
-// direct SQL query against the same file, since Store deliberately doesn't
-// expose a read API yet (that belongs to `meter top` in week 3).
+// requestRow is what tests read back via a direct SQL query, independent
+// of the store.TopRequests query path used by `meter top`.
 type requestRow struct {
 	project      string
 	model        string
@@ -133,11 +151,8 @@ func TestHandleMessages_NonStreamingHappyPath(t *testing.T) {
 	if row.inputTokens != 100 || row.outputTokens != 50 {
 		t.Errorf("tokens = %d/%d, want 100/50", row.inputTokens, row.outputTokens)
 	}
-	// Compare with a tolerance rather than "==": the compiler evaluates a
-	// constant expression like this one at arbitrary precision and rounds
-	// once at the end, while the production code path divides/multiplies
-	// float64s at runtime with a rounding step after each operation - the
-	// two can differ in the last bit even though both are "correct".
+	// Tolerance, not "==": constant-folded and runtime float64 arithmetic
+	// can differ in the last bit despite both being correct.
 	wantCost := (100.0/1_000_000)*3.0 + (50.0/1_000_000)*15.0
 	if math.Abs(row.costUSD-wantCost) > 1e-9 {
 		t.Errorf("cost = %v, want %v", row.costUSD, wantCost)
@@ -189,14 +204,8 @@ func TestHandleMessages_ClientDisconnect_CancelsUpstreamCall(t *testing.T) {
 	upstreamCanceled := make(chan struct{})
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// A real handler always reads the request body before responding.
-		// That drain matters here: Go's http.Server can only detect the
-		// client's connection closing (and cancel r.Context()) once it
-		// knows no unread body bytes remain - otherwise it can't tell a
-		// dead connection apart from a client that's just slow to finish
-		// sending. Skipping this line makes the cancellation below
-		// (correctly) never observed by this handler, which looks like a
-		// hang but is actually a net/http server guarantee, not a bug.
+		// Draining the body first matters: Go's server can only detect the
+		// client disconnecting once no unread body bytes remain.
 		io.Copy(io.Discard, r.Body)
 		close(upstreamHit)
 		<-r.Context().Done() // blocks until the client's cancellation propagates here
@@ -266,9 +275,8 @@ func TestHandleMessages_StreamingIsNotFullyBuffered(t *testing.T) {
 
 	env := newTestEnv(t, upstream.URL)
 
-	// A real server this time, not a ResponseRecorder: proving events reach
-	// the client before the upstream is done needs a real connection and a
-	// real client reading incrementally, not just an end-state comparison.
+	// A real server, not a ResponseRecorder: proving events arrive
+	// progressively needs a real connection read incrementally.
 	meterServer := httptest.NewServer(http.HandlerFunc(env.proxy.HandleMessages))
 	defer meterServer.Close()
 
@@ -301,9 +309,8 @@ func TestHandleMessages_StreamingIsNotFullyBuffered(t *testing.T) {
 	}
 	totalAt := time.Since(start)
 
-	// The actual proof this isn't week 1's buffer-everything approach: a
-	// fully-buffered implementation would only hand back any bytes at all
-	// once the upstream had already finished, so firstByteAt would be close
+	// The actual proof: a fully-buffered implementation would only hand
+	// back bytes once the upstream finished, so firstByteAt would be close
 	// to totalAt instead of close to zero.
 	if firstByteAt > upstreamDelay/2 {
 		t.Errorf("first event arrived after %v, want well under the %v upstream delay before the second event - looks like the response is being buffered before forwarding", firstByteAt, upstreamDelay)
@@ -352,6 +359,84 @@ func TestHandleMessages_ProjectHeaderNotForwardedUpstream(t *testing.T) {
 	}
 }
 
+func TestHandleMessages_OverCapRejectsBeforeReachingUpstream(t *testing.T) {
+	var upstreamHit bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	// Project cap of 0: any nonzero estimate is rejected, deterministically.
+	env := newTestEnvWithCaps(t, upstream.URL, 1000, 0)
+
+	reqBody, _ := json.Marshal(map[string]any{"model": "test-model", "max_tokens": 100})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set(projectHeader, "tight-project")
+	w := httptest.NewRecorder()
+
+	env.proxy.HandleMessages(w, req)
+
+	if upstreamHit {
+		t.Fatal("upstream was hit despite being over cap - reservation must happen before forwarding")
+	}
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", w.Code)
+	}
+
+	var body struct {
+		Error   string `json:"error"`
+		Cap     string `json:"cap"`
+		Project string `json:"project"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decoding 429 body: %v", err)
+	}
+	if body.Error != "budget_exceeded" || body.Cap != "project" || body.Project != "tight-project" {
+		t.Errorf("body = %+v, want error=budget_exceeded cap=project project=tight-project", body)
+	}
+
+	row := env.lastRow(t)
+	if row.statusCode != http.StatusTooManyRequests {
+		t.Errorf("persisted status_code = %d, want 429", row.statusCode)
+	}
+	if row.usageKnown != 0 {
+		t.Errorf("usage_known = %d, want 0 for a rejected request", row.usageKnown)
+	}
+}
+
+func TestHandleMessages_SuccessReconcilesIntoLedger(t *testing.T) {
+	const upstreamBody = `{"usage":{"input_tokens":100,"output_tokens":50}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(upstreamBody))
+	}))
+	defer upstream.Close()
+
+	env := newTestEnvWithCaps(t, upstream.URL, 1000, 1000)
+
+	reqBody, _ := json.Marshal(map[string]any{"model": "test-model", "max_tokens": 100})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set(projectHeader, "cognitiveradar")
+	w := httptest.NewRecorder()
+
+	env.proxy.HandleMessages(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+
+	committed, reserved := env.proxy.budget.Snapshot("cognitiveradar")
+	wantCommitted := (100.0/1_000_000)*3.0 + (50.0/1_000_000)*15.0
+	if math.Abs(committed-wantCommitted) > 1e-9 {
+		t.Errorf("committed = %v, want %v", committed, wantCommitted)
+	}
+	if reserved != 0 {
+		t.Errorf("reserved = %v, want 0 - the reservation should be fully released once reconciled", reserved)
+	}
+}
+
 // setupBenchUpstream is a minimal fake Anthropic for the benchmarks below:
 // drain the request, return a small fixed JSON response immediately.
 func setupBenchUpstream() *httptest.Server {
@@ -383,9 +468,7 @@ func BenchmarkDirectRequest(b *testing.B) {
 }
 
 // BenchmarkProxyRequest is the same request through meter's accounted
-// handler. The delta between this and BenchmarkDirectRequest's ns/op is
-// the actual added overhead per request - the week 2 "latency benchmark
-// vs. direct calls" deliverable.
+// handler; the ns/op delta from BenchmarkDirectRequest is the added overhead.
 func BenchmarkProxyRequest(b *testing.B) {
 	upstream := setupBenchUpstream()
 	defer upstream.Close()
@@ -405,7 +488,18 @@ func BenchmarkProxyRequest(b *testing.B) {
 		b.Fatalf("store.Open() error = %v", err)
 	}
 	defer st.Close()
-	p, err := New(upstream.URL, st, table)
+
+	capsPath := filepath.Join(dir, "caps.json")
+	const capsJSON = `{"global_daily_cap_usd": 1000, "default_project_cap_usd": 1000, "project_caps_usd": {}}`
+	if err := os.WriteFile(capsPath, []byte(capsJSON), 0o644); err != nil {
+		b.Fatalf("writing caps file: %v", err)
+	}
+	ledger, err := budget.New(capsPath)
+	if err != nil {
+		b.Fatalf("budget.New() error = %v", err)
+	}
+
+	p, err := New(upstream.URL, st, table, ledger)
 	if err != nil {
 		b.Fatalf("New() error = %v", err)
 	}

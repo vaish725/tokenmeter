@@ -1,11 +1,6 @@
-// Package pricing turns raw token counts into a dollar cost using a table
-// loaded from a JSON file rather than hardcoded constants.
-//
-// The PRD's own risk section calls this out explicitly: provider prices
-// change on their own schedule, so the table has to be editable without a
-// rebuild. An unknown model is not an error here - it is logged as such and
-// callers fall back to a zero, "cost unknown" cost rather than failing the
-// proxied request. A broken price list must never block a real LLM call.
+// Package pricing turns token counts into a dollar cost using a table
+// loaded from JSON (not hardcoded), since provider prices change on their
+// own schedule. An unknown model returns known=false rather than an error.
 package pricing
 
 import (
@@ -46,10 +41,8 @@ func Load(path string) (*Table, error) {
 	return &Table{models: parsed.Models}, nil
 }
 
-// Cost computes the USD cost of a request given its model name and token
-// counts. known is false when the model isn't in the table, in which case
-// cost is always zero - the caller should still persist the request with
-// usage_known=false rather than dropping the row or failing the call.
+// Cost computes USD cost from token counts. known=false for an unpriced
+// model; cost is always 0 in that case, not an error.
 func (t *Table) Cost(model string, inputTokens, outputTokens int) (cost float64, known bool) {
 	price, ok := t.models[model]
 	if !ok {
