@@ -5,6 +5,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/vaish725/tokenmeter/internal/budget"
 	"github.com/vaish725/tokenmeter/internal/config"
+	"github.com/vaish725/tokenmeter/internal/downshift"
 	"github.com/vaish725/tokenmeter/internal/pricing"
 	"github.com/vaish725/tokenmeter/internal/proxy"
 	"github.com/vaish725/tokenmeter/internal/store"
@@ -23,10 +26,23 @@ import (
 // SIGTERM/SIGINT before forcing a close.
 const shutdownTimeout = 30 * time.Second
 
+// version is overridden at build time via -ldflags "-X main.version=...",
+// which goreleaser sets to the release tag; "dev" for a local build.
+var version = "dev"
+
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "top" {
-		runTop(os.Args[2:])
-		return
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "top":
+			runTop(os.Args[2:])
+			return
+		case "watch":
+			runWatch(os.Args[2:])
+			return
+		case "version":
+			fmt.Println("meter " + version)
+			return
+		}
 	}
 	runServe()
 }
@@ -44,17 +60,29 @@ func runServe() {
 		log.Fatalf("meter: loading budget caps: %v", err)
 	}
 
+	// Downshift is opt-in: no configs/downshift.json means the policy is
+	// disabled entirely (nil table), not an error - every project just
+	// hard-blocks at cap the way it always has.
+	downshiftTable, err := downshift.Load(cfg.DownshiftPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Fatalf("meter: loading downshift policy: %v", err)
+		}
+		log.Printf("meter: no downshift policy at %s - caps hard-block at 429", cfg.DownshiftPath)
+		downshiftTable = nil
+	}
+
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
 		log.Fatalf("meter: opening store: %v", err)
 	}
 	defer st.Close()
 
-	anthropicProxy, err := proxy.NewAnthropic(cfg.AnthropicUpstreamURL, st, pricingTable, ledger)
+	anthropicProxy, err := proxy.NewAnthropic(cfg.AnthropicUpstreamURL, st, pricingTable, ledger, downshiftTable)
 	if err != nil {
 		log.Fatalf("meter: building anthropic proxy: %v", err)
 	}
-	openaiProxy, err := proxy.NewOpenAI(cfg.OpenAIUpstreamURL, st, pricingTable, ledger)
+	openaiProxy, err := proxy.NewOpenAI(cfg.OpenAIUpstreamURL, st, pricingTable, ledger, downshiftTable)
 	if err != nil {
 		log.Fatalf("meter: building openai proxy: %v", err)
 	}

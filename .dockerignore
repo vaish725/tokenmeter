@@ -1,0 +1,7 @@
+.git
+.github
+.claude
+prd.md
+*.db
+*.db-*
+/bin

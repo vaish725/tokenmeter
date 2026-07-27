@@ -5,5 +5,11 @@
 # Local build output, if anyone runs `go build -o bin/...`.
 /bin/
 
+# goreleaser's local build/snapshot output.
+/dist/
+
 # Never pushed to the GitHub remote - kept local-only by explicit instruction.
 /prd.md
+
+# Local Claude Code session state (permission cache, scheduled tasks) - not project source.
+/.claude/

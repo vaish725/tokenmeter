@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/vaish725/tokenmeter/internal/budget"
+	"github.com/vaish725/tokenmeter/internal/downshift"
 	"github.com/vaish725/tokenmeter/internal/pricing"
 	"github.com/vaish725/tokenmeter/internal/store"
 )
@@ -53,10 +54,11 @@ type spec struct {
 // Proxy is the generic accounted-and-streaming reverse proxy for one
 // provider, built from a spec.
 type Proxy struct {
-	spec    spec
-	store   *store.Store
-	pricing *pricing.Table
-	budget  *budget.Ledger
+	spec      spec
+	store     *store.Store
+	pricing   *pricing.Table
+	budget    *budget.Ledger
+	downshift *downshift.Table // nil => policy disabled, always 429 at cap
 
 	reverseProxy *httputil.ReverseProxy
 }
@@ -68,17 +70,18 @@ type requestStateKey struct{}
 // requestState is what ModifyResponse/ErrorHandler need to log and
 // reconcile a request, gathered once before it's forwarded.
 type requestState struct {
-	start         time.Time
-	project       string
-	model         string
-	stream        bool
-	reservationID string
+	start           time.Time
+	project         string
+	model           string
+	stream          bool
+	reservationID   string
+	downshiftedFrom string // "" unless this request was rewritten to a cheaper model
 }
 
 // newProxy builds a Proxy targeting upstreamURL for the given spec. No
 // fixed request timeout is set - LLM calls can run for minutes; only
-// client disconnect should cut one short.
-func newProxy(sp spec, upstreamURL string, st *store.Store, pt *pricing.Table, bl *budget.Ledger) (*Proxy, error) {
+// client disconnect should cut one short. dt may be nil (downshift disabled).
+func newProxy(sp spec, upstreamURL string, st *store.Store, pt *pricing.Table, bl *budget.Ledger, dt *downshift.Table) (*Proxy, error) {
 	target, err := url.Parse(strings.TrimSuffix(upstreamURL, "/"))
 	if err != nil {
 		return nil, fmt.Errorf("proxy: parsing upstream URL %q: %w", upstreamURL, err)
@@ -87,7 +90,7 @@ func newProxy(sp spec, upstreamURL string, st *store.Store, pt *pricing.Table, b
 		sp.rewriteBody = func(body []byte, _ requestMeta) []byte { return body }
 	}
 
-	p := &Proxy{spec: sp, store: st, pricing: pt, budget: bl}
+	p := &Proxy{spec: sp, store: st, pricing: pt, budget: bl, downshift: dt}
 	p.reverseProxy = &httputil.ReverseProxy{
 		Director:       p.director(target),
 		ModifyResponse: p.modifyResponse,
@@ -159,6 +162,23 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	// Reserve before forwarding - what makes the cap real under concurrency.
 	estimated := estimateCost(p.pricing, body, meta)
 	reservationID, ok, decision := p.budget.Reserve(project, estimated)
+
+	downshiftedFrom := ""
+	if !ok {
+		// Opt-in policy (nil Table => always the 429 below): one substitute
+		// attempt, no cascading through chained substitutes.
+		if substitute, hasSubstitute := p.downshift.Substitute(meta.Model); hasSubstitute {
+			substituteMeta := meta
+			substituteMeta.Model = substitute
+			substituteEstimate := estimateCost(p.pricing, body, substituteMeta)
+			if subID, subOK, _ := p.budget.Reserve(project, substituteEstimate); subOK {
+				reservationID, ok = subID, true
+				downshiftedFrom = meta.Model
+				body = rewriteModelField(body, substitute)
+				meta.Model = substitute
+			}
+		}
+	}
 	if !ok {
 		latency := time.Since(start)
 		p.persist(r.Context(), project, meta.Model, 0, 0, latency, http.StatusTooManyRequests, meta.Stream, false, "")
@@ -166,15 +186,33 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Re-wrap the (possibly provider-rewritten) body so it can be forwarded.
+	// Re-wrap the (possibly provider- or downshift-rewritten) body so it
+	// can be forwarded.
 	body = p.spec.rewriteBody(body, meta)
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
 
-	state := &requestState{start: start, project: project, model: meta.Model, stream: meta.Stream, reservationID: reservationID}
+	state := &requestState{start: start, project: project, model: meta.Model, stream: meta.Stream, reservationID: reservationID, downshiftedFrom: downshiftedFrom}
 	r = r.WithContext(context.WithValue(r.Context(), requestStateKey{}, state))
 
 	p.reverseProxy.ServeHTTP(w, r)
+}
+
+// rewriteModelField swaps the request body's top-level "model" field, used
+// to actually route a downshifted request to its cheaper substitute. A
+// decode failure returns the body unchanged - the upstream rejects
+// malformed JSON on its own, meter doesn't need to.
+func rewriteModelField(body []byte, model string) []byte {
+	var generic map[string]any
+	if err := json.Unmarshal(body, &generic); err != nil {
+		return body
+	}
+	generic["model"] = model
+	rewritten, err := json.Marshal(generic)
+	if err != nil {
+		return body
+	}
+	return rewritten
 }
 
 // writeBudgetExceeded writes R5's structured 429: which cap was hit, its
@@ -229,6 +267,13 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 
 	isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
 	scan := resp.StatusCode >= 200 && resp.StatusCode < 300
+
+	// Annotate via headers, not the provider's own JSON body, so no
+	// caller's SDK has to specially parse a substitution out of the response.
+	if state.downshiftedFrom != "" {
+		resp.Header.Set("X-Meter-Downshifted-From", state.downshiftedFrom)
+		resp.Header.Set("X-Meter-Downshifted-To", state.model)
+	}
 
 	resp.Body = newUsageScanningBody(resp.Body, isSSE, scan, p.spec.usageFields, func(inputTokens, outputTokens int, usageKnown bool) {
 		latency := time.Since(state.start)

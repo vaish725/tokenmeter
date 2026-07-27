@@ -72,7 +72,7 @@ func newTestEnvWithCaps(t *testing.T, upstreamURL string, globalCapUSD, projectC
 	}
 	t.Cleanup(func() { st.Close() })
 
-	p, err := NewAnthropic(upstreamURL, st, table, ledger)
+	p, err := NewAnthropic(upstreamURL, st, table, ledger, nil)
 	if err != nil {
 		t.Fatalf("NewAnthropic() error = %v", err)
 	}
@@ -503,7 +503,7 @@ func BenchmarkProxyRequest(b *testing.B) {
 		b.Fatalf("budget.New() error = %v", err)
 	}
 
-	p, err := NewAnthropic(upstream.URL, st, table, ledger)
+	p, err := NewAnthropic(upstream.URL, st, table, ledger, nil)
 	if err != nil {
 		b.Fatalf("NewAnthropic() error = %v", err)
 	}

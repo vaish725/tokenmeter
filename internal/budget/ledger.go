@@ -26,7 +26,10 @@ type Caps struct {
 	ProjectCapsUSD       map[string]float64 `json:"project_caps_usd"`
 }
 
-func (c *Caps) projectCap(project string) float64 {
+// ProjectCap returns project's daily cap: its own override if configured,
+// otherwise the default. Exported for meter watch and downshift re-estimates,
+// which need cap values outside the Ledger that enforces them.
+func (c *Caps) ProjectCap(project string) float64 {
 	if v, ok := c.ProjectCapsUSD[project]; ok {
 		return v
 	}
@@ -76,15 +79,26 @@ type Ledger struct {
 	orphanTimeout time.Duration // overridable in tests; defaultOrphanTimeout otherwise
 }
 
-// New loads caps from path and returns a ready-to-use Ledger.
-func New(path string) (*Ledger, error) {
+// LoadCaps reads and parses configs/caps.json. Exported so callers that
+// only need cap values (meter watch, downshift re-estimates) don't have to
+// build a whole Ledger to get them.
+func LoadCaps(path string) (Caps, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("budget: reading %s: %w", path, err)
+		return Caps{}, fmt.Errorf("budget: reading %s: %w", path, err)
 	}
 	var caps Caps
 	if err := json.Unmarshal(data, &caps); err != nil {
-		return nil, fmt.Errorf("budget: parsing %s: %w", path, err)
+		return Caps{}, fmt.Errorf("budget: parsing %s: %w", path, err)
+	}
+	return caps, nil
+}
+
+// New loads caps from path and returns a ready-to-use Ledger.
+func New(path string) (*Ledger, error) {
+	caps, err := LoadCaps(path)
+	if err != nil {
+		return nil, err
 	}
 	return &Ledger{
 		caps:          caps,
@@ -119,7 +133,7 @@ func (l *Ledger) Reserve(project string, estimatedCost float64) (id string, ok b
 	proj := l.projectBucket(project)
 	proj.resetIfStale(today)
 
-	projectCap := l.caps.projectCap(project)
+	projectCap := l.caps.ProjectCap(project)
 	if used := proj.committed + proj.reserved + estimatedCost; used > projectCap {
 		return "", false, Decision{Cap: "project", LimitUSD: projectCap, UsedUSD: used, ResetAt: nextMidnight(now)}
 	}

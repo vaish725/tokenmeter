@@ -156,6 +156,32 @@ func (s *Store) TopRequests(ctx context.Context, since time.Time, limit int) ([]
 	return records, nil
 }
 
+// SpendByProject sums cost_usd since since, grouped by project - the
+// building block for `meter watch`'s cumulative and burn-rate figures
+// (called with two different since values for each).
+func (s *Store) SpendByProject(ctx context.Context, since time.Time) (map[string]float64, error) {
+	const q = `SELECT project, SUM(cost_usd) FROM requests WHERE timestamp >= ? GROUP BY project`
+	rows, err := s.db.QueryContext(ctx, q, since.UTC().Format(time.RFC3339))
+	if err != nil {
+		return nil, fmt.Errorf("store: querying spend by project: %w", err)
+	}
+	defer rows.Close()
+
+	spend := make(map[string]float64)
+	for rows.Next() {
+		var project string
+		var total float64
+		if err := rows.Scan(&project, &total); err != nil {
+			return nil, fmt.Errorf("store: scanning spend row: %w", err)
+		}
+		spend[project] = total
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterating spend rows: %w", err)
+	}
+	return spend, nil
+}
+
 func boolToInt(b bool) int {
 	if b {
 		return 1

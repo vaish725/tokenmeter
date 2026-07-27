@@ -1,0 +1,56 @@
+# Config only in this pass - not yet invoked with real release credentials.
+# Validate locally with `goreleaser check`; a real `goreleaser release`
+# needs a GITHUB_TOKEN and is a separate, explicit step.
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: meter
+    main: ./cmd/meter
+    binary: meter
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: meter
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - configs/*.json
+
+checksum:
+  name_template: "checksums.txt"
+
+release:
+  github:
+    owner: vaish725
+    name: tokenmeter
+
+# Points at a separate homebrew-tap repo (not yet created) - `brew install
+# vaish725/tap/meter` once a real release publishes there. `brews` (the
+# classic Formula pipeline) is deprecated in goreleaser v2 in favor of
+# homebrew_casks, which now also covers plain CLI binaries via `binaries:`,
+# not just .app bundles - confirmed via `goreleaser check` against the
+# locally installed goreleaser (2.17.1); `binary:` (singular) is itself
+# a deprecated alias for `binaries:` as of the same version.
+homebrew_casks:
+  - name: meter
+    binaries: [meter]
+    repository:
+      owner: vaish725
+      name: homebrew-tap
+    directory: Casks
+    homepage: "https://github.com/vaish725/tokenmeter"
+    description: "Local LLM spend proxy with per-project attribution and daily caps"

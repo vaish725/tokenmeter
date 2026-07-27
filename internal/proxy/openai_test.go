@@ -50,7 +50,7 @@ func newOpenAITestEnv(t *testing.T, upstreamURL string) *testEnv {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	p, err := NewOpenAI(upstreamURL, st, table, ledger)
+	p, err := NewOpenAI(upstreamURL, st, table, ledger, nil)
 	if err != nil {
 		t.Fatalf("NewOpenAI() error = %v", err)
 	}

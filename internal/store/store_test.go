@@ -159,3 +159,36 @@ func TestOpenMigratesPreProviderColumnDatabase(t *testing.T) {
 		t.Fatalf("Insert() after migration error = %v", err)
 	}
 }
+
+func TestSpendByProject(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	now := time.Now()
+	rows := []Record{
+		{Timestamp: now, Project: "a", Provider: "anthropic", Model: "m", CostUSD: 1.0},
+		{Timestamp: now, Project: "a", Provider: "anthropic", Model: "m", CostUSD: 0.5},
+		{Timestamp: now, Project: "b", Provider: "openai", Model: "m", CostUSD: 2.0},
+		{Timestamp: now.Add(-48 * time.Hour), Project: "a", Provider: "anthropic", Model: "m", CostUSD: 100.0}, // outside the window
+	}
+	for _, r := range rows {
+		if err := s.Insert(ctx, r); err != nil {
+			t.Fatalf("Insert() error = %v", err)
+		}
+	}
+
+	spend, err := s.SpendByProject(ctx, now.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("SpendByProject() error = %v", err)
+	}
+
+	if spend["a"] != 1.5 {
+		t.Errorf("spend[a] = %v, want 1.5 (old row outside the window must be excluded)", spend["a"])
+	}
+	if spend["b"] != 2.0 {
+		t.Errorf("spend[b] = %v, want 2.0", spend["b"])
+	}
+	if len(spend) != 2 {
+		t.Errorf("len(spend) = %d, want 2 projects", len(spend))
+	}
+}

@@ -31,6 +31,12 @@ type Config struct {
 
 	// CapsPath is the JSON file holding daily spend caps.
 	CapsPath string
+
+	// DownshiftPath is the JSON file mapping model -> cheaper substitute.
+	// The downshift policy is opt-in: a missing file (the default - none
+	// ships in this repo) means every project hard-blocks at cap, unchanged
+	// from before this policy existed.
+	DownshiftPath string
 }
 
 // Environment variable names, kept as constants so main.go and tests agree.
@@ -42,6 +48,7 @@ const (
 	envDBPath            = "METER_DB_PATH"
 	envPricingPath       = "METER_PRICING_PATH"
 	envCapsPath          = "METER_CAPS_PATH"
+	envDownshiftPath     = "METER_DOWNSHIFT_PATH"
 )
 
 // Defaults chosen so `meter` with no environment set up at all still runs.
@@ -53,6 +60,7 @@ const (
 	defaultDBPath            = "./meter.db"
 	defaultPricingPath       = "./configs/pricing.json"
 	defaultCapsPath          = "./configs/caps.json"
+	defaultDownshiftPath     = "./configs/downshift.json"
 )
 
 // Load reads config from the environment, defaulting anything unset. It
@@ -66,6 +74,7 @@ func Load() Config {
 		DBPath:               getEnvOrDefault(envDBPath, defaultDBPath),
 		PricingPath:          getEnvOrDefault(envPricingPath, defaultPricingPath),
 		CapsPath:             getEnvOrDefault(envCapsPath, defaultCapsPath),
+		DownshiftPath:        getEnvOrDefault(envDownshiftPath, defaultDownshiftPath),
 	}
 }
 
