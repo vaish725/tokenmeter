@@ -94,3 +94,14 @@ homebrew_casks:
     homepage: "https://github.com/vaish725/tokenmeter"
     description: "Local LLM spend proxy with per-project attribution and daily caps"
     license: "MIT"
+    # The binary isn't codesigned/notarized (no Apple Developer account in
+    # this pipeline), so macOS quarantines it on download and Gatekeeper
+    # kills it on first run (SIGKILL, exit 137) - verified locally right
+    # after a real `brew install --cask meter`. Clearing the quarantine bit
+    # post-install is the standard fix for unsigned CLI-only casks.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/meter"]
+          end
