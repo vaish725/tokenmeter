@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vaish725/tokenmeter/internal/apikeys"
 	"github.com/vaish725/tokenmeter/internal/budget"
 	"github.com/vaish725/tokenmeter/internal/downshift"
 	"github.com/vaish725/tokenmeter/internal/pricing"
@@ -59,6 +60,7 @@ type Proxy struct {
 	pricing   *pricing.Table
 	budget    *budget.Ledger
 	downshift *downshift.Table // nil => policy disabled, always 429 at cap
+	apiKeys   *apikeys.Table   // nil => attribution link disabled
 
 	reverseProxy *httputil.ReverseProxy
 }
@@ -80,8 +82,9 @@ type requestState struct {
 
 // newProxy builds a Proxy targeting upstreamURL for the given spec. No
 // fixed request timeout is set - LLM calls can run for minutes; only
-// client disconnect should cut one short. dt may be nil (downshift disabled).
-func newProxy(sp spec, upstreamURL string, st *store.Store, pt *pricing.Table, bl *budget.Ledger, dt *downshift.Table) (*Proxy, error) {
+// client disconnect should cut one short. dt and ak may both be nil
+// (downshift / API-key attribution disabled, respectively).
+func newProxy(sp spec, upstreamURL string, st *store.Store, pt *pricing.Table, bl *budget.Ledger, dt *downshift.Table, ak *apikeys.Table) (*Proxy, error) {
 	target, err := url.Parse(strings.TrimSuffix(upstreamURL, "/"))
 	if err != nil {
 		return nil, fmt.Errorf("proxy: parsing upstream URL %q: %w", upstreamURL, err)
@@ -90,7 +93,7 @@ func newProxy(sp spec, upstreamURL string, st *store.Store, pt *pricing.Table, b
 		sp.rewriteBody = func(body []byte, _ requestMeta) []byte { return body }
 	}
 
-	p := &Proxy{spec: sp, store: st, pricing: pt, budget: bl, downshift: dt}
+	p := &Proxy{spec: sp, store: st, pricing: pt, budget: bl, downshift: dt, apiKeys: ak}
 	p.reverseProxy = &httputil.ReverseProxy{
 		Director:       p.director(target),
 		ModifyResponse: p.modifyResponse,
@@ -146,7 +149,7 @@ func estimateCost(pt *pricing.Table, body []byte, meta requestMeta) float64 {
 // once it's known how the request turned out.
 func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	project := resolveProject(r)
+	project := p.resolveProject(r)
 
 	body, err := readLimitedBody(w, r, maxRequestBodyBytes)
 	if err != nil {
@@ -338,13 +341,35 @@ func (p *Proxy) persist(ctx context.Context, project, model string, inputTokens,
 	}
 }
 
-// resolveProject is R4's first attribution link: an explicit header.
-// API-key mapping and cwd inference (the rest of the chain) remain deferred.
-func resolveProject(r *http.Request) string {
-	if p := r.Header.Get(projectHeader); p != "" {
-		return p
+// resolveProject is R4's attribution chain: an explicit header first, then
+// a recognized API key, then unattributed. Client-cwd inference (the
+// PRD's own third, unresolved link) stays deferred - a localhost proxy
+// has no reliable, portable way to learn a client's working directory.
+func (p *Proxy) resolveProject(r *http.Request) string {
+	if v := r.Header.Get(projectHeader); v != "" {
+		return v
+	}
+	if key := extractAPIKey(r); key != "" {
+		if project, ok := p.apiKeys.Lookup(key); ok {
+			return project
+		}
 	}
 	return unattributedProject
+}
+
+// extractAPIKey reads the caller's own API key straight off the request -
+// never logged or stored, used only for the Lookup call above. Anthropic
+// uses x-api-key; OpenAI uses "Authorization: Bearer <key>". Checking both
+// unconditionally is simpler than threading a per-provider header name
+// through spec for what's really the same three-line check either way.
+func extractAPIKey(r *http.Request) string {
+	if key := r.Header.Get("x-api-key"); key != "" {
+		return key
+	}
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimPrefix(auth, "Bearer ")
+	}
+	return ""
 }
 
 // readLimitedBody reads the request body up to maxBytes, using

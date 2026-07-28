@@ -64,7 +64,7 @@ func newDownshiftTestEnv(t *testing.T, upstreamURL string, projectCapUSD float64
 	}
 	t.Cleanup(func() { st.Close() })
 
-	p, err := NewAnthropic(upstreamURL, st, table, ledger, dt)
+	p, err := NewAnthropic(upstreamURL, st, table, ledger, dt, nil)
 	if err != nil {
 		t.Fatalf("NewAnthropic() error = %v", err)
 	}

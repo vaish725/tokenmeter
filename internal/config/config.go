@@ -37,6 +37,11 @@ type Config struct {
 	// ships in this repo) means every project hard-blocks at cap, unchanged
 	// from before this policy existed.
 	DownshiftPath string
+
+	// APIKeysPath is the JSON file mapping an API key's last 8 characters
+	// to a project. Opt-in like DownshiftPath: a missing file (the default)
+	// means this attribution link is simply skipped.
+	APIKeysPath string
 }
 
 // Environment variable names, kept as constants so main.go and tests agree.
@@ -49,6 +54,7 @@ const (
 	envPricingPath       = "METER_PRICING_PATH"
 	envCapsPath          = "METER_CAPS_PATH"
 	envDownshiftPath     = "METER_DOWNSHIFT_PATH"
+	envAPIKeysPath       = "METER_API_KEYS_PATH"
 )
 
 // Defaults chosen so `meter` with no environment set up at all still runs.
@@ -61,6 +67,7 @@ const (
 	defaultPricingPath       = "./configs/pricing.json"
 	defaultCapsPath          = "./configs/caps.json"
 	defaultDownshiftPath     = "./configs/downshift.json"
+	defaultAPIKeysPath       = "./configs/api_keys.json"
 )
 
 // Load reads config from the environment, defaulting anything unset. It
@@ -75,6 +82,7 @@ func Load() Config {
 		PricingPath:          getEnvOrDefault(envPricingPath, defaultPricingPath),
 		CapsPath:             getEnvOrDefault(envCapsPath, defaultCapsPath),
 		DownshiftPath:        getEnvOrDefault(envDownshiftPath, defaultDownshiftPath),
+		APIKeysPath:          getEnvOrDefault(envAPIKeysPath, defaultAPIKeysPath),
 	}
 }
 

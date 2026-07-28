@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vaish725/tokenmeter/internal/apikeys"
 	"github.com/vaish725/tokenmeter/internal/budget"
 	"github.com/vaish725/tokenmeter/internal/config"
 	"github.com/vaish725/tokenmeter/internal/downshift"
@@ -72,17 +73,28 @@ func runServe() {
 		downshiftTable = nil
 	}
 
+	// API-key attribution is opt-in the same way: no configs/api_keys.json
+	// means that link of R4's chain is simply skipped.
+	apiKeysTable, err := apikeys.Load(cfg.APIKeysPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Fatalf("meter: loading API key mapping: %v", err)
+		}
+		log.Printf("meter: no API key mapping at %s - attribution falls back to %s header or unattributed", cfg.APIKeysPath, "X-Meter-Project")
+		apiKeysTable = nil
+	}
+
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
 		log.Fatalf("meter: opening store: %v", err)
 	}
 	defer st.Close()
 
-	anthropicProxy, err := proxy.NewAnthropic(cfg.AnthropicUpstreamURL, st, pricingTable, ledger, downshiftTable)
+	anthropicProxy, err := proxy.NewAnthropic(cfg.AnthropicUpstreamURL, st, pricingTable, ledger, downshiftTable, apiKeysTable)
 	if err != nil {
 		log.Fatalf("meter: building anthropic proxy: %v", err)
 	}
-	openaiProxy, err := proxy.NewOpenAI(cfg.OpenAIUpstreamURL, st, pricingTable, ledger, downshiftTable)
+	openaiProxy, err := proxy.NewOpenAI(cfg.OpenAIUpstreamURL, st, pricingTable, ledger, downshiftTable, apiKeysTable)
 	if err != nil {
 		log.Fatalf("meter: building openai proxy: %v", err)
 	}

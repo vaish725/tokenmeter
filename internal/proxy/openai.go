@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 
+	"github.com/vaish725/tokenmeter/internal/apikeys"
 	"github.com/vaish725/tokenmeter/internal/budget"
 	"github.com/vaish725/tokenmeter/internal/downshift"
 	"github.com/vaish725/tokenmeter/internal/pricing"
@@ -18,10 +19,10 @@ var openAISpec = spec{
 	rewriteBody: injectStreamUsageOption,
 }
 
-// NewOpenAI builds a Proxy for the OpenAI Chat Completions API. dt may be
-// nil (downshift policy disabled).
-func NewOpenAI(upstreamURL string, st *store.Store, pt *pricing.Table, bl *budget.Ledger, dt *downshift.Table) (*Proxy, error) {
-	return newProxy(openAISpec, upstreamURL, st, pt, bl, dt)
+// NewOpenAI builds a Proxy for the OpenAI Chat Completions API. dt and ak
+// may both be nil (downshift / API-key attribution disabled).
+func NewOpenAI(upstreamURL string, st *store.Store, pt *pricing.Table, bl *budget.Ledger, dt *downshift.Table, ak *apikeys.Table) (*Proxy, error) {
+	return newProxy(openAISpec, upstreamURL, st, pt, bl, dt, ak)
 }
 
 // injectStreamUsageOption is OpenAI's one provider-specific body rewrite:

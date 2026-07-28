@@ -47,8 +47,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
 export OPENAI_BASE_URL=http://127.0.0.1:8081
 ```
 
-Every SDK call now goes through meter unmodified. Tag a project explicitly
-with a header if you want; otherwise requests are logged as `unattributed`:
+Every SDK call now goes through meter unmodified. A request is attributed
+to a project in this order: an explicit `X-Meter-Project` header, then a
+recognized API key (`configs/api_keys.json`), then `unattributed`:
 
 ```sh
 curl $ANTHROPIC_BASE_URL/v1/messages \
@@ -95,7 +96,7 @@ raised it:
 
 ## Configuration
 
-All three files are plain JSON, live in `configs/`, and can be edited
+All four files are plain JSON, live in `configs/`, and can be edited
 without a rebuild:
 
 - `pricing.json` - USD per million tokens, per model, plus an optional
@@ -108,6 +109,12 @@ without a rebuild:
   optional per-project overrides. Resets at local midnight.
 - `downshift.json` - optional, absent by default. Maps a model to a
   cheaper substitute to try before returning a `429`.
+- `api_keys.json` - optional, absent by default. Maps the **last 8
+  characters** of an API key to a project, for clients that can't send a
+  custom header. Only the suffix, never the full key: that's enough
+  entropy to tell apart a personal set of keys without this file ever
+  being a second copy of anything usable to authenticate as you if it
+  leaked. Shape: `{"projects": {"<last 8 chars>": "project-name"}}`.
 
 Paths and ports are all overridable by environment variable; see
 `internal/config/config.go` for the full list and defaults.

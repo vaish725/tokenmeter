@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"github.com/vaish725/tokenmeter/internal/apikeys"
 	"github.com/vaish725/tokenmeter/internal/budget"
 	"github.com/vaish725/tokenmeter/internal/downshift"
 	"github.com/vaish725/tokenmeter/internal/pricing"
@@ -15,8 +16,8 @@ var anthropicSpec = spec{
 	usageFields: newUsageFields("input_tokens", "output_tokens"),
 }
 
-// NewAnthropic builds a Proxy for the Anthropic Messages API. dt may be
-// nil (downshift policy disabled).
-func NewAnthropic(upstreamURL string, st *store.Store, pt *pricing.Table, bl *budget.Ledger, dt *downshift.Table) (*Proxy, error) {
-	return newProxy(anthropicSpec, upstreamURL, st, pt, bl, dt)
+// NewAnthropic builds a Proxy for the Anthropic Messages API. dt and ak
+// may both be nil (downshift / API-key attribution disabled).
+func NewAnthropic(upstreamURL string, st *store.Store, pt *pricing.Table, bl *budget.Ledger, dt *downshift.Table, ak *apikeys.Table) (*Proxy, error) {
+	return newProxy(anthropicSpec, upstreamURL, st, pt, bl, dt, ak)
 }
