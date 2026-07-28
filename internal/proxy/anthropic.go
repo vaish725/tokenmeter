@@ -17,7 +17,8 @@ var anthropicSpec = spec{
 }
 
 // NewAnthropic builds a Proxy for the Anthropic Messages API. dt and ak
-// may both be nil (downshift / API-key attribution disabled).
-func NewAnthropic(upstreamURL string, st *store.Store, pt *pricing.Table, bl *budget.Ledger, dt *downshift.Table, ak *apikeys.Table) (*Proxy, error) {
-	return newProxy(anthropicSpec, upstreamURL, st, pt, bl, dt, ak)
+// may both be nil (downshift / API-key attribution disabled); cc's zero
+// value disables prompt capture.
+func NewAnthropic(upstreamURL string, st *store.Store, pt *pricing.Table, bl *budget.Ledger, dt *downshift.Table, ak *apikeys.Table, cc CaptureConfig) (*Proxy, error) {
+	return newProxy(anthropicSpec, upstreamURL, st, pt, bl, dt, ak, cc)
 }

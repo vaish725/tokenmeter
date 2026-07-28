@@ -14,10 +14,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vaish725/tokenmeter/internal/anomaly"
 	"github.com/vaish725/tokenmeter/internal/apikeys"
 	"github.com/vaish725/tokenmeter/internal/budget"
 	"github.com/vaish725/tokenmeter/internal/config"
 	"github.com/vaish725/tokenmeter/internal/downshift"
+	"github.com/vaish725/tokenmeter/internal/metrics"
 	"github.com/vaish725/tokenmeter/internal/pricing"
 	"github.com/vaish725/tokenmeter/internal/proxy"
 	"github.com/vaish725/tokenmeter/internal/store"
@@ -39,6 +41,9 @@ func main() {
 			return
 		case "watch":
 			runWatch(os.Args[2:])
+			return
+		case "export":
+			runExport(os.Args[2:])
 			return
 		case "version":
 			fmt.Println("meter " + version)
@@ -90,24 +95,34 @@ func runServe() {
 	}
 	defer st.Close()
 
-	anthropicProxy, err := proxy.NewAnthropic(cfg.AnthropicUpstreamURL, st, pricingTable, ledger, downshiftTable, apiKeysTable)
+	captureConfig := proxy.CaptureConfig{Enabled: cfg.CapturePrompts, MaxBytes: cfg.CapturePromptsMaxBytes}
+	if cfg.CapturePrompts {
+		log.Printf("meter: prompt-body capture is ON (max %d bytes/request) - opted in via %s", cfg.CapturePromptsMaxBytes, "METER_CAPTURE_PROMPTS")
+	}
+
+	anthropicProxy, err := proxy.NewAnthropic(cfg.AnthropicUpstreamURL, st, pricingTable, ledger, downshiftTable, apiKeysTable, captureConfig)
 	if err != nil {
 		log.Fatalf("meter: building anthropic proxy: %v", err)
 	}
-	openaiProxy, err := proxy.NewOpenAI(cfg.OpenAIUpstreamURL, st, pricingTable, ledger, downshiftTable, apiKeysTable)
+	openaiProxy, err := proxy.NewOpenAI(cfg.OpenAIUpstreamURL, st, pricingTable, ledger, downshiftTable, apiKeysTable, captureConfig)
 	if err != nil {
 		log.Fatalf("meter: building openai proxy: %v", err)
 	}
 
 	anthropicServer := &http.Server{Addr: cfg.ListenAddr, Handler: mux(anthropicProxy)}
 	openaiServer := &http.Server{Addr: cfg.OpenAIListenAddr, Handler: mux(openaiProxy)}
+	metricsServer := &http.Server{Addr: cfg.MetricsListenAddr, Handler: metricsMux(st)}
 
 	// Listen for SIGINT/SIGTERM so a Ctrl-C or `systemctl stop` drains
 	// in-flight requests instead of dropping them mid-call.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	serverErr := make(chan error, 2)
+	// Always on, not opt-in: this only ever logs a warning, never changes
+	// request handling, so there's no behavior to guard by default.
+	go anomaly.NewChecker(st).Run(ctx)
+
+	serverErr := make(chan error, 3)
 	go func() {
 		log.Printf("meter: anthropic listening on %s, forwarding to %s", cfg.ListenAddr, cfg.AnthropicUpstreamURL)
 		serverErr <- anthropicServer.ListenAndServe()
@@ -115,6 +130,10 @@ func runServe() {
 	go func() {
 		log.Printf("meter: openai listening on %s, forwarding to %s", cfg.OpenAIListenAddr, cfg.OpenAIUpstreamURL)
 		serverErr <- openaiServer.ListenAndServe()
+	}()
+	go func() {
+		log.Printf("meter: metrics listening on %s (/metrics)", cfg.MetricsListenAddr)
+		serverErr <- metricsServer.ListenAndServe()
 	}()
 
 	select {
@@ -132,7 +151,26 @@ func runServe() {
 		if err := openaiServer.Shutdown(shutdownCtx); err != nil {
 			log.Printf("meter: openai server shutdown did not complete cleanly: %v", err)
 		}
+		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("meter: metrics server shutdown did not complete cleanly: %v", err)
+		}
 	}
+}
+
+// metricsMux serves Prometheus text exposition format at /metrics,
+// computed fresh from the store on every scrape.
+func metricsMux(st *store.Store) *http.ServeMux {
+	m := http.NewServeMux()
+	m.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		rows, err := st.MetricsSnapshot(r.Context())
+		if err != nil {
+			http.Error(w, "querying metrics", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		w.Write([]byte(metrics.Format(rows)))
+	})
+	return m
 }
 
 // mux builds a server's routes from a provider Proxy: its own accounted

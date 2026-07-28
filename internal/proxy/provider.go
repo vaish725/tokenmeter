@@ -52,6 +52,14 @@ type spec struct {
 	rewriteBody func(body []byte, meta requestMeta) []byte
 }
 
+// CaptureConfig controls the opt-in prompt-body capture feature. The zero
+// value is the safe default: disabled, exactly like the PRD's own non-goal
+// on storing prompt bodies by default.
+type CaptureConfig struct {
+	Enabled  bool
+	MaxBytes int
+}
+
 // Proxy is the generic accounted-and-streaming reverse proxy for one
 // provider, built from a spec.
 type Proxy struct {
@@ -61,6 +69,7 @@ type Proxy struct {
 	budget    *budget.Ledger
 	downshift *downshift.Table // nil => policy disabled, always 429 at cap
 	apiKeys   *apikeys.Table   // nil => attribution link disabled
+	capture   CaptureConfig
 
 	reverseProxy *httputil.ReverseProxy
 }
@@ -78,13 +87,15 @@ type requestState struct {
 	stream          bool
 	reservationID   string
 	downshiftedFrom string // "" unless this request was rewritten to a cheaper model
+	promptBody      []byte // nil unless capture is enabled
+	promptTruncated bool
 }
 
 // newProxy builds a Proxy targeting upstreamURL for the given spec. No
 // fixed request timeout is set - LLM calls can run for minutes; only
 // client disconnect should cut one short. dt and ak may both be nil
 // (downshift / API-key attribution disabled, respectively).
-func newProxy(sp spec, upstreamURL string, st *store.Store, pt *pricing.Table, bl *budget.Ledger, dt *downshift.Table, ak *apikeys.Table) (*Proxy, error) {
+func newProxy(sp spec, upstreamURL string, st *store.Store, pt *pricing.Table, bl *budget.Ledger, dt *downshift.Table, ak *apikeys.Table, cc CaptureConfig) (*Proxy, error) {
 	target, err := url.Parse(strings.TrimSuffix(upstreamURL, "/"))
 	if err != nil {
 		return nil, fmt.Errorf("proxy: parsing upstream URL %q: %w", upstreamURL, err)
@@ -93,7 +104,7 @@ func newProxy(sp spec, upstreamURL string, st *store.Store, pt *pricing.Table, b
 		sp.rewriteBody = func(body []byte, _ requestMeta) []byte { return body }
 	}
 
-	p := &Proxy{spec: sp, store: st, pricing: pt, budget: bl, downshift: dt, apiKeys: ak}
+	p := &Proxy{spec: sp, store: st, pricing: pt, budget: bl, downshift: dt, apiKeys: ak, capture: cc}
 	p.reverseProxy = &httputil.ReverseProxy{
 		Director:       p.director(target),
 		ModifyResponse: p.modifyResponse,
@@ -183,8 +194,10 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !ok {
+		// Never captured on a rejection - meter blocked the call itself,
+		// so there's no "which call cost this" story to keep a copy of.
 		latency := time.Since(start)
-		p.persist(r.Context(), project, meta.Model, 0, 0, latency, http.StatusTooManyRequests, meta.Stream, false, "")
+		p.persist(r.Context(), project, meta.Model, 0, 0, latency, http.StatusTooManyRequests, meta.Stream, false, "", nil, false)
 		writeBudgetExceeded(w, project, decision)
 		return
 	}
@@ -195,10 +208,29 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
 
-	state := &requestState{start: start, project: project, model: meta.Model, stream: meta.Stream, reservationID: reservationID, downshiftedFrom: downshiftedFrom}
+	var promptBody []byte
+	var promptTruncated bool
+	if p.capture.Enabled {
+		promptBody, promptTruncated = truncateForCapture(body, p.capture.MaxBytes)
+	}
+
+	state := &requestState{
+		start: start, project: project, model: meta.Model, stream: meta.Stream,
+		reservationID: reservationID, downshiftedFrom: downshiftedFrom,
+		promptBody: promptBody, promptTruncated: promptTruncated,
+	}
 	r = r.WithContext(context.WithValue(r.Context(), requestStateKey{}, state))
 
 	p.reverseProxy.ServeHTTP(w, r)
+}
+
+// truncateForCapture bounds a captured prompt body to maxBytes, so nothing
+// oversized is ever held longer than the length of this call.
+func truncateForCapture(body []byte, maxBytes int) (captured []byte, truncated bool) {
+	if len(body) <= maxBytes {
+		return body, false
+	}
+	return body[:maxBytes], true
 }
 
 // rewriteModelField swaps the request body's top-level "model" field, used
@@ -291,7 +323,7 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 		latency := time.Since(state.start)
 		// WithoutCancel: the client's own disconnect must not also cancel
 		// the DB write logging that same disconnect.
-		p.persist(context.WithoutCancel(resp.Request.Context()), state.project, state.model, inputTokens, outputTokens, latency, resp.StatusCode, state.stream, usageKnown, state.reservationID)
+		p.persist(context.WithoutCancel(resp.Request.Context()), state.project, state.model, inputTokens, outputTokens, latency, resp.StatusCode, state.stream, usageKnown, state.reservationID, state.promptBody, state.promptTruncated)
 	})
 	return nil
 }
@@ -302,7 +334,7 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 func (p *Proxy) handleProxyError(w http.ResponseWriter, r *http.Request, err error) {
 	if state, ok := r.Context().Value(requestStateKey{}).(*requestState); ok {
 		latency := time.Since(state.start)
-		p.persist(context.WithoutCancel(r.Context()), state.project, state.model, 0, 0, latency, 0, state.stream, false, state.reservationID)
+		p.persist(context.WithoutCancel(r.Context()), state.project, state.model, 0, 0, latency, 0, state.stream, false, state.reservationID, state.promptBody, state.promptTruncated)
 	}
 
 	if r.Context().Err() != nil {
@@ -314,8 +346,10 @@ func (p *Proxy) handleProxyError(w http.ResponseWriter, r *http.Request, err err
 
 // persist writes a request record; a DB failure is logged, not returned -
 // a broken meter must never block a working call. reservationID "" means
-// nothing was reserved (a rejected request); otherwise it's reconciled here.
-func (p *Proxy) persist(ctx context.Context, project, model string, inputTokens, outputTokens int, latency time.Duration, statusCode int, stream, usageKnown bool, reservationID string) {
+// nothing was reserved (a rejected request); otherwise it's reconciled
+// here. promptBody is nil unless capture is enabled and this request
+// actually reached the provider (never set on a rejection).
+func (p *Proxy) persist(ctx context.Context, project, model string, inputTokens, outputTokens int, latency time.Duration, statusCode int, stream, usageKnown bool, reservationID string, promptBody []byte, promptTruncated bool) {
 	cost, _ := p.pricing.Cost(model, inputTokens, outputTokens)
 
 	if reservationID != "" {
@@ -336,8 +370,16 @@ func (p *Proxy) persist(ctx context.Context, project, model string, inputTokens,
 		UsageKnown:   usageKnown,
 	}
 
-	if err := p.store.Insert(ctx, rec); err != nil {
+	id, err := p.store.Insert(ctx, rec)
+	if err != nil {
 		log.Printf("meter: failed to persist request record: %v", err)
+		return
+	}
+
+	if promptBody != nil {
+		if err := p.store.InsertPromptCapture(ctx, id, promptBody, promptTruncated); err != nil {
+			log.Printf("meter: failed to persist prompt capture: %v", err)
+		}
 	}
 }
 

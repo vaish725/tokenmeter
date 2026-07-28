@@ -62,7 +62,7 @@ func newAPIKeyTestEnv(t *testing.T, upstreamURL string) *testEnv {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	p, err := NewAnthropic(upstreamURL, st, table, ledger, nil, ak)
+	p, err := NewAnthropic(upstreamURL, st, table, ledger, nil, ak, CaptureConfig{})
 	if err != nil {
 		t.Fatalf("NewAnthropic() error = %v", err)
 	}

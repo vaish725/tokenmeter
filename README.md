@@ -65,6 +65,7 @@ curl $ANTHROPIC_BASE_URL/v1/messages \
 | `meter` | Runs the proxy: an Anthropic-facing listener and an OpenAI-facing listener, on separate ports. |
 | `meter top` | The costliest requests in a time window (`--since`, `--limit`). |
 | `meter watch` | A live-refreshing dashboard: spend, burn rate, time to cap, per project. |
+| `meter export` | Dumps a time window of requests as CSV (`--since`, `--out`), for spreadsheets or another tool's pipeline. |
 | `meter version` | Prints the build version. |
 
 ## How it works
@@ -117,7 +118,34 @@ without a rebuild:
   leaked. Shape: `{"projects": {"<last 8 chars>": "project-name"}}`.
 
 Paths and ports are all overridable by environment variable; see
-`internal/config/config.go` for the full list and defaults.
+`internal/config/config.go` for the full list and defaults. Two more,
+opt-in and off by default:
+
+- `METER_CAPTURE_PROMPTS` - set to `true` to store each request's raw
+  prompt body alongside its request record, for later inspection. Off by
+  default (see [Non-goals](#non-goals)); each captured body is truncated
+  to `METER_CAPTURE_PROMPTS_MAX_BYTES` (default 51200, 50KB).
+- `METER_METRICS_LISTEN_ADDR` - where the Prometheus `/metrics` endpoint
+  binds (default `127.0.0.1:9090`).
+
+## Exporting and monitoring
+
+- **CSV.** `meter export --since 24h > spend.csv` dumps every request in
+  the window, one row per call.
+- **Prometheus.** `/metrics` on `METER_METRICS_LISTEN_ADDR` serves
+  `meter_requests_total{project,provider,model,status}`,
+  `meter_cost_usd_total{project,provider}`, and
+  `meter_tokens_total{project,provider,direction}`, computed fresh from
+  SQLite on every scrape - counters stay accurate across a restart since
+  they're not held in process memory.
+- **Cost anomaly detection.** Always on, no config needed. Every 10
+  minutes, meter compares each active project's spend so far this hour
+  against its own trailing 7-day p95-by-hour and logs a warning if the
+  current hour is already above it. This only ever logs; it never blocks
+  or alters a request, so unlike downshift or capture there's no reason
+  to gate it behind an opt-in flag. A project with no meaningful trailing
+  history yet is never flagged, so a brand-new project's first hour of
+  traffic doesn't trip a false alarm.
 
 ## Performance
 

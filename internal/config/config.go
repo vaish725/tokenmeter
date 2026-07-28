@@ -2,7 +2,10 @@
 // variables. Every setting has a default, so meter runs with zero config.
 package config
 
-import "os"
+import (
+	"os"
+	"strconv"
+)
 
 // Config holds everything the rest of the program needs to start. Two
 // listen addresses, one per provider: ANTHROPIC_BASE_URL and
@@ -42,6 +45,15 @@ type Config struct {
 	// to a project. Opt-in like DownshiftPath: a missing file (the default)
 	// means this attribution link is simply skipped.
 	APIKeysPath string
+
+	// CapturePrompts opts into storing request prompt bodies (never on by
+	// default - see the PRD's own non-goal on this). CapturePromptsMaxBytes
+	// bounds how much of a body gets kept, truncating anything larger.
+	CapturePrompts         bool
+	CapturePromptsMaxBytes int
+
+	// MetricsListenAddr is where the Prometheus /metrics endpoint binds.
+	MetricsListenAddr string
 }
 
 // Environment variable names, kept as constants so main.go and tests agree.
@@ -55,6 +67,9 @@ const (
 	envCapsPath          = "METER_CAPS_PATH"
 	envDownshiftPath     = "METER_DOWNSHIFT_PATH"
 	envAPIKeysPath       = "METER_API_KEYS_PATH"
+	envCapturePrompts    = "METER_CAPTURE_PROMPTS"
+	envCaptureMaxBytes   = "METER_CAPTURE_PROMPTS_MAX_BYTES"
+	envMetricsListenAddr = "METER_METRICS_LISTEN_ADDR"
 )
 
 // Defaults chosen so `meter` with no environment set up at all still runs.
@@ -68,6 +83,8 @@ const (
 	defaultCapsPath          = "./configs/caps.json"
 	defaultDownshiftPath     = "./configs/downshift.json"
 	defaultAPIKeysPath       = "./configs/api_keys.json"
+	defaultCaptureMaxBytes   = 50 * 1024 // 50KB
+	defaultMetricsListenAddr = "127.0.0.1:9090"
 )
 
 // Load reads config from the environment, defaulting anything unset. It
@@ -83,6 +100,10 @@ func Load() Config {
 		CapsPath:             getEnvOrDefault(envCapsPath, defaultCapsPath),
 		DownshiftPath:        getEnvOrDefault(envDownshiftPath, defaultDownshiftPath),
 		APIKeysPath:          getEnvOrDefault(envAPIKeysPath, defaultAPIKeysPath),
+
+		CapturePrompts:         getEnvBool(envCapturePrompts, false),
+		CapturePromptsMaxBytes: getEnvInt(envCaptureMaxBytes, defaultCaptureMaxBytes),
+		MetricsListenAddr:      getEnvOrDefault(envMetricsListenAddr, defaultMetricsListenAddr),
 	}
 }
 
@@ -91,4 +112,23 @@ func getEnvOrDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// getEnvBool parses key as a bool, defaulting (and silently ignoring an
+// unparseable value) rather than failing startup over an opt-in flag.
+func getEnvBool(key string, fallback bool) bool {
+	v, err := strconv.ParseBool(os.Getenv(key))
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+// getEnvInt parses key as an int, same defaulting behavior as getEnvBool.
+func getEnvInt(key string, fallback int) int {
+	v, err := strconv.Atoi(os.Getenv(key))
+	if err != nil {
+		return fallback
+	}
+	return v
 }

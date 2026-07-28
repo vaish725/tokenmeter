@@ -20,9 +20,10 @@ var openAISpec = spec{
 }
 
 // NewOpenAI builds a Proxy for the OpenAI Chat Completions API. dt and ak
-// may both be nil (downshift / API-key attribution disabled).
-func NewOpenAI(upstreamURL string, st *store.Store, pt *pricing.Table, bl *budget.Ledger, dt *downshift.Table, ak *apikeys.Table) (*Proxy, error) {
-	return newProxy(openAISpec, upstreamURL, st, pt, bl, dt, ak)
+// may both be nil (downshift / API-key attribution disabled); cc's zero
+// value disables prompt capture.
+func NewOpenAI(upstreamURL string, st *store.Store, pt *pricing.Table, bl *budget.Ledger, dt *downshift.Table, ak *apikeys.Table, cc CaptureConfig) (*Proxy, error) {
+	return newProxy(openAISpec, upstreamURL, st, pt, bl, dt, ak, cc)
 }
 
 // injectStreamUsageOption is OpenAI's one provider-specific body rewrite:
