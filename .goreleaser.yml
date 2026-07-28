@@ -1,6 +1,3 @@
-# Config only in this pass - not yet invoked with real release credentials.
-# Validate locally with `goreleaser check`; a real `goreleaser release`
-# needs a GITHUB_TOKEN and is a separate, explicit step.
 version: 2
 
 before:
@@ -37,6 +34,48 @@ release:
   github:
     owner: vaish725
     name: tokenmeter
+
+# Two single-arch images, combined into one multi-arch tag below - Dockerfile.
+# goreleaser (not the top-level Dockerfile, which is for a local `docker
+# build` from source) expects the binary goreleaser already cross-compiled.
+dockers:
+  - id: meter-amd64
+    image_templates:
+      - "ghcr.io/vaish725/tokenmeter:{{ .Version }}-amd64"
+    dockerfile: Dockerfile.goreleaser
+    goos: linux
+    goarch: amd64
+    # goreleaser's plain "docker build" doesn't set the image's target
+    # platform on its own - verified locally: without this, every image
+    # came out tagged for the host's own arch (arm64) regardless of goarch,
+    # which would have shipped a broken "-amd64" tag containing an arm64
+    # binary. buildx + an explicit --platform fixes it.
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+    extra_files:
+      - configs
+  - id: meter-arm64
+    image_templates:
+      - "ghcr.io/vaish725/tokenmeter:{{ .Version }}-arm64"
+    dockerfile: Dockerfile.goreleaser
+    goos: linux
+    goarch: arm64
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+    extra_files:
+      - configs
+
+docker_manifests:
+  - name_template: "ghcr.io/vaish725/tokenmeter:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/vaish725/tokenmeter:{{ .Version }}-amd64"
+      - "ghcr.io/vaish725/tokenmeter:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/vaish725/tokenmeter:latest"
+    image_templates:
+      - "ghcr.io/vaish725/tokenmeter:{{ .Version }}-amd64"
+      - "ghcr.io/vaish725/tokenmeter:{{ .Version }}-arm64"
 
 # Points at a separate homebrew-tap repo (not yet created) - `brew install
 # vaish725/tap/meter` once a real release publishes there. `brews` (the

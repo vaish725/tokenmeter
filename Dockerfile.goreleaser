@@ -1,0 +1,16 @@
+# Used by goreleaser only: goreleaser cross-compiles the binary itself
+# (see .goreleaser.yml's builds: section) and copies the already-built
+# binary for each platform into this image - no Go toolchain needed here,
+# unlike the top-level Dockerfile which builds from source for a local
+# `docker build`. Still needs its own CA certificate bundle for the same
+# reason as the top-level Dockerfile: FROM scratch ships none, and this
+# binary makes outbound HTTPS calls to the Anthropic/OpenAI APIs.
+FROM alpine:3 AS certs
+RUN apk add --no-cache ca-certificates
+
+FROM scratch
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY meter /meter
+COPY configs /configs
+EXPOSE 8080 8081
+ENTRYPOINT ["/meter"]
