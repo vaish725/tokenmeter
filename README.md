@@ -5,15 +5,7 @@ Anthropic or OpenAI base URL at it and get per-project cost tracking, a
 hard daily limit that actually stops requests, and a ranked list of your
 most expensive calls, without touching a single call site.
 
-```
-meter watch - 14:32:07 (refreshing every tick, Ctrl-C to quit)
-
-PROJECT         TODAY    CAP     $/HR     TIME TO CAP
-cognitiveradar  $1.8400  $2.00   $6.2000  1m32s
-infra-mind      $0.3100  $2.00   $0.4000  4h13m0s
-pr-pilot        $0.0000  $2.00   $0.0000  -
-GLOBAL          $2.1500  $5.00   $6.6000  25m54s
-```
+![meter watch showing today's spend, burn rate, and time to cap, refreshed live per project and globally](docs/meter-watch.png)
 
 ## The problem
 
@@ -93,6 +85,13 @@ curl $ANTHROPIC_BASE_URL/v1/messages \
   could point at the same port, but both APIs expose overlapping paths
   (`/v1/models`), so a single listener cannot tell an unmatched request's
   provider apart. Separate ports sidestep that.
+
+Every field above comes straight out of the local SQLite database - no
+telemetry, nothing phoned home. Real captured traffic, including a run of
+requests hitting a per-project cap (`status 429`) before a config change
+raised it:
+
+![Raw sqlite3 query against meter.db showing real request rows: timestamp, project, model, input/output tokens, cost, latency, HTTP status, stream flag, usage-known flag, and provider - several rows show status 429 from a request exceeding its project's daily cap](docs/sqlite-output.png)
 
 ## Configuration
 
